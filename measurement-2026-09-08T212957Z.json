@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-09-08T21:29:57.377079+00:00",
+  "finished_at_utc": "2026-09-08T21:29:57.420885+00:00",
+  "baseline_file": "baseline-2026-09-08T212838Z.json",
+  "queries": {
+    "status_before": {"command": ":GU#", "response": "nNG001000960"},
+    "tracking_before": {"command": ":GAT#", "response": "0"},
+    "sidereal_before": {"command": ":GS#", "response": "03:50:33"},
+    "equatorial": {"command": ":GMEQ#", "response": "22:04:22&+89*59:56"},
+    "sidereal_after": {"command": ":GS#", "response": "03:50:34"},
+    "pier_side": {"command": ":Gm#", "response": "E"},
+    "status_after": {"command": ":GU#", "response": "nNG001000960"},
+    "tracking_after": {"command": ":GAT#", "response": "0"}
+  },
+  "derived": {
+    "sky_hour_angle_degrees_bracket": [86.54583333333333, 86.55],
+    "declination_degrees": 89.99888888888889,
+    "nearest_branch_lower_axis_change_degrees_bracket": [-3.45416666666667, -3.45],
+    "distance_from_declination_pole_degrees": 0.0011111111111111111
+  },
+  "interpretation": "Stationary, tracking off. Under the ideal mechanical mapping, selecting the candidate closest to the baseline gives approximately -3.45 degrees of lower/RA axis movement and only 4 arcseconds of upper-axis displacement from the pole. This assumes baseline mechanical reference continuity; baseline DEC was exactly +90 and side was N, so the initial branch and absolute joint reference were not independently established. The E side is recorded but not assumed to be a validated branch selector. These are endpoint estimates, not measured global-frame motion or a trajectory reconstruction. No motion or configuration commands were sent."
+}

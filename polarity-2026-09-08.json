@@ -1,0 +1,19 @@
+{
+  "model": "AM5N",
+  "firmware": "1.6.3",
+  "reference_file": "baseline-2026-09-08T212838Z.json",
+  "positive_directions": ["west", "south"],
+  "scope": "Measured locally in current EQ configuration; not validated across pier-side changes, homing, sync, or reconfiguration",
+  "speed_degrees_s": 0.05,
+  "maximum_jog_seconds": 2.0,
+  "measured_displacements_degrees": {
+    "east": [-0.0916666667, 0.0],
+    "west": [0.0875, 0.0],
+    "north": [0.0, -0.0919444444],
+    "south": [0.0, 0.0916666667]
+  },
+  "initial_offsets_degrees": [-0.0083333333, -12.4244444444],
+  "final_offsets_degrees": [-0.0083333333, -12.4247222222],
+  "stationary_readout_ra_variation_degrees": 0.0041666667,
+  "notes": "Each jog independently stopped and inspected. Return used short reverse jogs, not the P position controller. Firmware-derived displacement, not independent encoder metrology."
+}

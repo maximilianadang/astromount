@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-09-08T21:28:38.677106+00:00",
+  "finished_at_utc": "2026-09-08T21:28:38.730020+00:00",
+  "port": "/dev/serial/by-id/usb-ZWO_Systems_ZWO_Device_123456-if00",
+  "queries": {
+    "model": {"command": ":GVP#", "response": "AM5N"},
+    "firmware": {"command": ":GV#", "response": "1.6.3"},
+    "status_before": {"command": ":GU#", "response": "nNG000000000"},
+    "tracking_before": {"command": ":GAT#", "response": "0"},
+    "sidereal_before": {"command": ":GS#", "response": "03:49:15"},
+    "equatorial": {"command": ":GMEQ#", "response": "09:49:15&+90*00:00"},
+    "sidereal_after": {"command": ":GS#", "response": "03:49:15"},
+    "pier_side": {"command": ":Gm#", "response": "N"},
+    "status_after": {"command": ":GU#", "response": "nNG000000000"},
+    "tracking_after": {"command": ":GAT#", "response": "0"}
+  },
+  "derived": {
+    "sky_hour_angle_degrees": -90.0,
+    "declination_degrees": 90.0
+  },
+  "interpretation": "Stationary equatorial status, tracking off. Sky hour angle is LST minus RA, not a calibrated mechanical joint angle. Pointing side N at DEC +90 does not establish physical homing. Compare subsequent samples using the firmware clock and branch continuity; retain this baseline unchanged."
+}

@@ -1,0 +1,22 @@
+{
+  "captured_at_utc": "2026-09-08T21:35:11.452818+00:00",
+  "finished_at_utc": "2026-09-08T21:35:11.496083+00:00",
+  "baseline_file": "baseline-2026-09-08T212838Z.json",
+  "queries": {
+    "status_before": {"command": ":GU#", "response": "nNG000000890"},
+    "tracking_before": {"command": ":GAT#", "response": "0"},
+    "sidereal_before": {"command": ":GS#", "response": "03:55:48"},
+    "equatorial": {"command": ":GMEQ#", "response": "09:55:50&+77*34:32"},
+    "sidereal_after": {"command": ":GS#", "response": "03:55:48"},
+    "pier_side": {"command": ":Gm#", "response": "W"},
+    "status_after": {"command": ":GU#", "response": "nNG000000890"},
+    "tracking_after": {"command": ":GAT#", "response": "0"}
+  },
+  "derived": {
+    "sky_hour_angle_degrees": -90.00833333333333,
+    "declination_degrees": 77.57555555555555,
+    "nearest_branch_lower_axis_change_degrees": -0.008333333333333333,
+    "nearest_branch_upper_axis_change_degrees": -12.424444444444445
+  },
+  "interpretation": "Relative to the original baseline, the nearest ideal mechanical branch gives lower/RA approximately -0.0083 degrees and upper/DEC approximately -12.4244 degrees. Consistent with reverting the lower axis and then moving the upper axis. No intermediate read was taken after reversion, so these are net offsets from the original baseline, not an isolated measurement of the second maneuver. Signs are model conventions, not calibrated clockwise/counterclockwise ground yaw. Initial pole/reference ambiguity and unmeasured physical geometry remain. Stationary with tracking off. No motion or configuration commands sent."
+}

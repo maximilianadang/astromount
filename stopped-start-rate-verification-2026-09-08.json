@@ -1,0 +1,14 @@
+{
+  "axis": "DEC",
+  "direction": "north",
+  "requested_speed_degrees_s": 0.025,
+  "commands": [":Rv5.98#", ":Mn#"],
+  "measured_signed_speed_degrees_s": -0.025032824192333866,
+  "initial_offsets_degrees": [-0.008333333333354176, -12.545277777777756],
+  "final_offsets_degrees": [-0.008333333333354176, -12.595],
+  "displacement_degrees": -0.04972222222224332,
+  "time_limit_seconds": 2,
+  "final_status": "nNG101000650",
+  "stationary_samples": 3,
+  "conclusion": "0.025 deg/s is achievable from stopped with the existing encoding. Earlier mismatch depends on live-update sequence/state, not a general minimum-speed limit. Exact firmware cause remains unestablished."
+}

@@ -1,0 +1,13 @@
+{
+  "model": "AM5N",
+  "firmware": "1.6.3",
+  "axis": "DEC",
+  "requested_rates_degrees_s": [0.05, 0.1, 0.025],
+  "nominal_phase_seconds": 1.5,
+  "rate_only_south_measured_rates_degrees_s": [0.0500056427, 0.0499080580, 0.0500628719],
+  "rate_then_repeat_direction_north_measured_rates_degrees_s": [-0.0499981520, -0.0972279770, -0.0835025463],
+  "initial_offsets_degrees": [-0.0083333333, -12.4247222222],
+  "final_offsets_degrees": [-0.0083333333, -12.5452777778],
+  "conclusion": "Rv alone did not change active speed. Rv plus repeated M changed speed but did not reproduce the requested low speed. Do not assume accurate live velocity control or remove stop/restart on this evidence.",
+  "limitations": "Short low-speed tests, opposite directions, firmware-derived displacement; no independent physical velocity measurement or high-speed validation. Both jogs ended with stop and three stationary samples."
+}

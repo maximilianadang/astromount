@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astromount"
+version = "0.1.0"
+description = "Small synchronous Python interface for ZWO AM5/AM5N mounts"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5,<4"]
+
+[tool.setuptools]
+py-modules = ["astromount", "astromount_control"]
