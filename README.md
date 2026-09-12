@@ -1,6 +1,6 @@
 # astromount
 
-Small synchronous Python API for ZWO AM5/AM5N mounts. Two modules, one dependency
+Small synchronous Python API for ZWO AM5/AM5N mounts. Three modules, one dependency
 (`pyserial`), no background polling or service. A controller can import it directly.
 
 ## Install
@@ -35,6 +35,154 @@ not absolute encoder measurements or simultaneous joint-angle samples.
 
 ## Control
 
+### Command-line pointing
+
+Local defaults live in `astromount_config.py`: `PORT`, `BASELINE`, `POLARITY`,
+and `FRAME`. The active baseline is `baseline-2026-09-11-1032.json`; CLI overrides
+remain available. Change the shared config rather than editing individual tools.
+Historical experiments in `commission.py` retain their explicitly pinned September 8
+baseline/test envelopes; they are not replacements for the current `point.py` CLI.
+Live reads and saved references share one coordinate decoder and clock-bracket
+validation. Baseline capture uses the same raw coordinate sampling method.
+
+To capture a replacement baseline, first physically restore the agreed zero pose
+(telescope forward, upper axis vertical, fixed manual settings unchanged), then:
+
+```bash
+.venv/bin/python zero_mount.py baseline-new.json
+```
+
+This performs only getters and saves three stationary, tracking-off samples. It
+refuses an existing output file and does not home, sync, move, change motor signs,
+or replace the default baseline. The script cannot verify physical pose or the
+mechanical branch/sign calibration. A power cycle can invalidate the reference;
+capturing an arbitrary orientation does not recalibrate the FRD geometry.
+Explicitly select the new reference on subsequent commands with
+`point.py --baseline baseline-new.json ...`. Capture does not resolve the reported
+return timeout or validate the displacement-guard fix; it is not permission to
+resume the spiral.
+
+From this project directory:
+
+```bash
+.venv/bin/python point.py 0 0
+.venv/bin/python point.py 5 2 --speed 1
+.venv/bin/python point.py 5 2 --delta --duration 10
+.venv/bin/python point.py --help
+```
+
+Arguments are fixed-root FRD **azimuth, elevation in degrees**, relative to the
+original saved baseline. Positive azimuth turns right; positive elevation raises
+the nose. These commands move physical hardware (except `--help`). The CLI uses
+the observed signs `pitch_sign=+1`, `yaw_sign=-1`, converts the target with IK,
+and calls `control.run_pointing(frame, azimuth=..., elevation=...)`. Both joints
+are driven concurrently whenever both have position error. No planner heartbeat is
+required for a blocking single target. Default speed cap is 1°/s (maximum 3); timeout is
+30 seconds. The 1.25° stopping margin and existing controller checks remain enabled.
+
+`--delta` adds the supplied az/el to the current measured root-frame az/el, not
+to joint angles. For point moves, `--duration SECONDS` replaces `--speed`: the
+common joint-speed cap is the largest IK joint displacement divided by duration,
+capped at 3°/s. This is nominal timing, not a timed trajectory: proportional
+slowdown, settling, and the cap can extend travel time. The arrival timeout becomes
+duration plus `--timeout`. Zero-distance moves only settle; unrepresentably slow
+rates are rejected. These options require a stationary live read and cannot use
+`--dry-run`. Spiral `--duration` and `--speed` retain their existing meanings.
+
+For sequential absolute waypoints, use `sequence.py --path waypoints.csv`:
+
+```csv
+az,el,duration
+5,0,5
+5,5,5
+0,0,10
+```
+
+The entire CSV is checked for valid targets, safety boundaries, and positive finite
+durations before opening the port. Each waypoint uses the same duration-based
+point controller and waits for arrival/settling before advancing. One connection
+is held throughout; an error or Ctrl-C ends the sequence, with active motion using
+the controller's existing stop-on-exit behavior. Completion prints one JSON record
+per waypoint. `--timeout` applies per waypoint in addition to its duration.
+`--port`, `--baseline`, and `--polarity` work as in `point.py`.
+`sequence.py --path waypoints.csv --dry-run` validates without opening the device;
+live-dependent speed feasibility is checked before each move.
+
+Baseline and polarity paths default relative to the script, not the shell directory.
+Override with `--baseline`, `--polarity`, and `--port`. Completion prints joint
+offsets, model-estimated az/el, and status; errors return a nonzero exit code.
+Keep the E-stop available. The single-axis signs were observed physically;
+the adapted controller reached one combined (+1°, +1°) target at .1°/s on hardware.
+That verifies firmware-feedback convergence, not independent optical accuracy.
+
+### Commissioning CLI
+
+`commission.py` replaces the five standalone commissioning/probe scripts. It shares
+connection setup, preflight, telemetry, stationary verification, and raw-test timers.
+`point.py`, `zero_mount.py`, and `measure.py` remain the everyday interfaces.
+
+| Previous script | New command |
+| --- | --- |
+| `calibrate_jog.py west` | `commission.py jog west` |
+| `calibrate_jog.py south --live-rate-test --repeat-direction` | `commission.py jog south --live-rate-test --repeat-direction` |
+| `probe_simultaneous.py` | `commission.py simultaneous` |
+| `probe_simultaneous.py --rate-updates` | `commission.py simultaneous --rate-updates` |
+| `probe_pointing.py` | `commission.py pointing` |
+| `probe_spiral.py` | `commission.py spiral` |
+| `test_position_live.py out` / `back` | `commission.py position out` / `back` |
+
+All experiments command physical motion. `--help` is offline. Global options go
+**before** the subcommand. To deliberately use the new physical baseline:
+
+```bash
+.venv/bin/python commission.py --help
+.venv/bin/python commission.py --baseline baseline-2026-09-11-1032.json pointing
+.venv/bin/python commission.py --baseline baseline-2026-09-11-1032.json position out --record trial.json
+.venv/bin/python commission.py --baseline baseline-2026-09-11-1032.json position back --record trial.json
+```
+
+Non-spiral experiments default to the historical September 8 baseline for
+reproducibility; `spiral` uses the active configured baseline. Choose explicitly
+when commissioning the current physical setup. Position tests retain `.1`/`1`
+degree choices and separate out/back invocations. Existing outward records cannot
+be overwritten; returns require a successful out, unchanged endpoint, and matching
+degrees/reference when recorded. Logs now share one JSON telemetry format; saved
+historical logs are unchanged. Raw tests retain short watchdogs, bounded rates,
+local excursion checks and global stop cleanup; all modes verify stationary exit.
+The raw jog additionally uses the shared overspeed check. No experiment was run
+on hardware during this consolidation. The spiral fix still needs physical validation.
+
+### Continuous az/el and spiral experiment
+
+The existing worker also accepts `arm_pointing(frame, azimuth=..., elevation=...)`
+and `set_pointing(frame, azimuth=..., elevation=..., issued_at=...)`, where
+`frame = Pointing(pitch_sign=1, yaw_sign=-1)` for the observed setup. Arm once;
+then publish the planner's latest target at approximately 10 Hz. `issued_at` is
+local monotonic generation time (defaults to now). Each update replaces the
+mailbox and renews the existing 0.5-second heartbeat. No new controller or queue.
+Keep the worker context open for the session; leaving it attempts to stop.
+`worker.snapshot.state.pointing(frame)` returns FK-estimated az/el when a state
+is available. Blocking calls return the same State type. Neither interface adds
+a per-motor thread; the controller sends serial commands, and firmware runs both motors.
+
+```bash
+# Offline: no serial access.
+.venv/bin/python point.py 0 0 --spiral 5 --dry-run
+# PAUSED pending combined-controller hardware validation. This commands motion:
+.venv/bin/python point.py 0 0 --spiral 5 --duration 120 --speed 1
+```
+
+The spiral is a true 5-degree angular cone about baseline forward, restricted to
+at most 5 degrees for this initial experiment. Targets are generated at 10 Hz
+from elapsed time, skipping missed ticks. Both motors can run concurrently at
+independent capped rates, with local stop/restart for changed rates. Tracking
+may lag; this is not a guarantee of a smooth path or a hard measured cone bound.
+Individual-axis directions have been observed; combined trajectory tracking has
+not yet been validated on hardware. Keep the E-stop ready. The saved baseline
+must still be valid, and the approach from the current pose must be unobstructed.
+Existing excursion, freshness, progress and stop checks remain unchanged; the
+continuous-motion timeout covers the requested duration plus two arrival timeouts.
+
 These calls **physically move the mount or change tracking**; they are examples,
 not part of the read-only check above:
 
@@ -49,7 +197,7 @@ mount.home()
 
 `goto` takes sky coordinates, requires the mount's time/site/alignment to be set,
 and may enable tracking on arrival. It does not accept pitch/yaw or raw motor
-angles. Use the horizon mapping below for ground-relative setpoints.
+angles. It is a separate low-level firmware operation, not used by the joint controller.
 `move` selects one shared firmware speed index (0..9), then starts continuous
 directional motion. `guide` uses the existing guide-rate setting and returns
 without waiting for the pulse to finish. The external controller schedules pulses,
@@ -72,19 +220,35 @@ already have executed. A connection failure does not prove motion stopped.
 
 `astromount_control` adds a synchronous proportional (P) velocity loop. Targets
 are **absolute joint offsets from a saved reference**, in degrees—not celestial
-RA/DEC, encoder readings, or calibrated world azimuth/elevation.
+RA/DEC or encoder readings. `run_pointing` and the worker's pointing methods use
+the configured FRD kinematics to convert root az/el to these joint targets;
+`state.pointing(frame)` maps measured joints back through FK.
 
-- Defaults: gain 0.5/s, speed cap 0.1°/s, requested sampling 10 Hz, deadband 0.02°.
+- Defaults: gain 0.5/s, speed cap 0.1°/s, requested sampling 10 Hz, deadband 0.01°.
 - Excursion: ±22.5° per joint; stop boundary is ±22.25° with the default margin.
-  Targets must be strictly inside ±22.23° to reserve deadband clearance.
+  Targets must be strictly inside ±22.24° to reserve deadband clearance.
 - Reads combined firmware equatorial coordinates bracketed by sidereal time;
   reconstructs the nearest continuous mechanical branch relative to the baseline.
-- Moves one axis at a time because firmware uses a shared speed setting. Stops
-  before changing speed/direction; no go-to, homing, synchronization, or tracking setters.
+- Computes a capped P velocity for each joint on every tick. Stops/restarts only
+  axes whose commanded velocity changes; unchanged axes continue. No go-to,
+  homing, synchronization, or tracking setters. Arrival requires both joints.
 - Requires EQ mode, tracking off, and a stationary start. Rejects stale reads,
   unexpected displacement, reversed motion, stalled progress, and reported faults.
+  Displacement bounds account for commanded motion anywhere since the previous
+  accepted sample, including motion before a stop/cancelled restart. After that
+  interval is consumed, idle axes return to the deadband-sized bound. Stops do
+  not erase interval history; rejected samples do not advance it. This is a
+  conservative speed-cap bound, not a feedforward prediction of exact travel.
+  Progress checks are per axis: one moving joint cannot conceal a stalled partner.
 - Returns after three stationary samples inside deadband. Timeout (300 s),
   cancellation, exceptions, and Ctrl-C attempt a stop, reconnecting if needed.
+
+Concurrent unequal low rates and axis-local rate changes were measured on AM5N
+firmware 1.6.3. The adapted controller also reached root az/el (+1°, +1°) at .1°/s
+with measured 10 Hz feedback and both joints inside deadband. Live reversals and
+streamed trajectory updates still need physical validation. Independent P loops
+do not promise simultaneous arrival or a straight
+az/el path. The original 3°/s experiment was single-axis, not combined control.
 
 The deadband is a starting tolerance, not measured accuracy. Tune it using observed
 readout resolution, jitter, and stopping behavior. Actual read frequency depends
@@ -113,8 +277,8 @@ the upper joint's offset. This sequence is relative to the **saved baseline**, n
 whatever position the mount occupies when started. It may first reposition the
 lower axis if that axis is not at baseline. Upper-axis rotation corresponds to
 ground yaw only when its axis is vertical; arbitrary ground targets still require
-the fixed-base rigid-body calibration. The older `mount.yaw()` below is a
-different, astronomical mapping and is not the control interface for this setup.
+the fixed-base geometry below. The controller itself accepts joint offsets;
+the pointing layer converts root-frame az/el into those targets.
 
 For an external algorithm, call `run()` with successive absolute joint targets;
 `on_sample(state)` supplies telemetry and `cancel=threading.Event()` allows
@@ -136,6 +300,62 @@ direction signs, and stop/restart behavior need controlled physical validation.
 Software limits are not hard travel limits or collision protection: serial loss,
 a blocked process, and stopping distance can defeat them. Keep the physical E-stop
 available; a transmitted stop is not proof that the mount stopped.
+
+## Fixed-root FRD pointing kinematics
+
+`astromount_kinematics.Pointing` is a pure, degree-based mapping for the agreed
+ideal geometry: root +X front, +Y right, +Z down; lower joint axis lateral, upper
+axis vertical at the original baseline; the chosen plate-forward vector is +X.
+The original saved baseline remains zero. No new baseline is captured.
+
+The ordered orientation is `Ry(pitch) Rz(yaw)`: the lower joint carries the upper
+axis. Azimuth is positive toward right; elevation positive upward. This is
+pointing-direction kinematics, not Cartesian position/full-pose IK. Link lengths
+and the telescope-to-plate transform are deliberately excluded.
+
+```python
+from astromount_kinematics import Pointing
+
+# Explicit NOMINAL sign assumption, not independently verified FRD polarity:
+frame = Pointing(pitch_sign=1, yaw_sign=1, limit=22.5)
+az, el = frame.forward(lower=-0.0083333333, upper=-12.4244444444)
+lower, upper = frame.inverse(azimuth=5, elevation=5)
+# Inside an already armed worker, publishing this target commands motion:
+worker.set_target(ra_degrees=lower, dec_degrees=upper)
+```
+
+`pitch_sign=+1` means increasing the measured lower offset raises the nose;
+`yaw_sign=+1` means increasing the upper offset turns right at baseline. Use -1
+for either reversed relationship. These required parameters are distinct from
+the measured west/south command polarity. The physical FRD signs have not been
+independently established; do not treat this example as that calibration.
+
+The inverse is analytic and unique on the configured local branch (each joint
+limited to less than 90°). Unreachable az/el targets and invalid inputs raise
+`ValueError`; no numerical solver, queued trajectory, or firmware go-to is used.
+The controller's existing stopping margin is stricter than the geometric limit
+and still applies when accepting the resulting joint targets.
+
+Nominal (+1,+1) mapping of the saved manual captures, in degrees:
+
+| Configuration | Lower offset | Upper offset | Root azimuth | Root elevation |
+|---|---:|---:|---:|---:|
+| Original baseline | 0 | 0 | 0 | 0 |
+| First manual capture (clock-bracket midpoint) | -3.452083 | +0.001111 | +0.001113 | -3.452083 |
+| Second manual capture | -0.008333 | -12.424444 | -12.424445 | -0.008138 |
+
+These are model predictions for captured endpoints, not measured root-frame
+angles or established mechanical travel limits. For the configured ±22.5° joint
+box, lower-only endpoints are (az 0°, el ±22.5°), upper-only endpoints are
+(az ±22.5°, el 0°), and the four corners are (az ±24.148675°, el ±20.704811°).
+The boundary is curved, not a rectangular az/el box or an exact circular cone.
+
+Nominal geometry source: [ZWO AM5N structural drawings, printed page 30](https://i.zwoastro.com/wp-content/uploads/2026/03/b063feaca7a20b4c23090773c351e501.pdf#page=31),
+together with the installation posture described by the operator. Root alignment
+and telescope pointing accuracy are not established by an algebraic round trip.
+Tests cover independent rotation composition, all sign combinations, boundaries,
+unreachable targets, and recovery of the saved joint offsets. This new layer has
+not been tested on physical hardware.
 
 ## Streaming planner interface (no ROS dependency)
 
@@ -163,16 +383,18 @@ with Worker(control, heartbeat=0.5) as worker:
 
 This example commands physical motion when armed. All targets remain absolute
 degree offsets from the unchanged saved reference. Use `Settings(max_speed=3,
-margin=1.25)` on the underlying controller for the tested cap; other defaults are
+margin=1.25)` on the underlying controller for the previously tested single-axis cap; other defaults are
 unchanged. `run()` remains available for blocking, single-target applications;
 do not call it or access the Mount/Controller while its Worker is running.
 
 - The worker reads feedback, then takes the newest mailbox target. Missed ticks
   are skipped, not replayed. It rechecks target identity, lifecycle, heartbeat,
-  and measurement age at dispatch, including after the stop before a changed jog.
+  and measurement age at dispatch, including between axes and after each local stop.
   An update/stop before that boundary cancels the old decision. After commitment,
   one serial operation can still finish; commands already committed cannot be
-  recalled. The mailbox lock is never held across serial I/O.
+  recalled. `applied` identifies the target used at a dispatch boundary, not an
+  atomic two-motor update or arrival acknowledgment. The mailbox lock is never
+  held across serial I/O.
 - Pass `issued_at` from **this process's monotonic clock**, captured when the
   planner starts generating the target. Old, duplicate/out-of-order timestamps,
   future timestamps, invalid angles, and expired leases are rejected without
@@ -242,50 +464,6 @@ fault monitoring/re-arm, no-progress across reversals, missed ticks, and failed
 stop transmission. These tests cover those cases, not every possible scheduling
 interleaving or physical/transport failure.
 
-## Horizon targets and relative yaw
-
-`PointingFrame` converts between RA/DEC and geometric azimuth/altitude using one
-reversible rotation, with no extra dependency or hardware access:
-
-```python
-from astromount import PointingFrame
-
-# Illustrative values, NOT this mount's measured setup:
-frame = PointingFrame(latitude_degrees=40, sidereal_hours=6)
-ra, dec = frame.equatorial(azimuth_degrees=90, altitude_degrees=30)
-az, alt = frame.horizontal(ra_hours=ra, dec_degrees=dec)
-```
-
-The frame requires correct polar alignment, a calibrated mount pointing model,
-and local sidereal time consistent with the mount at the sample/target epoch.
-Sidereal time is NOT your clock's local time. Supply a fresh frame for each
-operation; it does not advance automatically. Latitude alone cannot calibrate an
-arbitrarily tilted base, home offset, or camera mounting error. Refraction is omitted.
-
-With an open `mount`, these methods **send motion commands**:
-
-```python
-mount.goto_horizontal(frame, azimuth_degrees=90, altitude_degrees=30)
-mount.yaw(+5, frame=frame)
-mount.yaw(-5, frame=frame)
-```
-
-These are alternative examples, not a sequence to run immediately: each go-to
-returns before arrival. `yaw` reads the reported position, adds degrees to azimuth,
-preserves altitude, and reuses `goto_horizontal` / `goto`. Positive yaw increases
-azimuth (north -> east); azimuth wraps at 360 degrees. The entire read/target
-operation is locked. It requires equatorial mode with no active slew. Nonfinite
-inputs, out-of-range latitudes/altitudes, and undefined output angles at coordinate
-poles raise errors. Zero/full-turn yaw is a no-op.
-
-These are **position setpoints at the frame's epoch**, not timed motor jogs, joint
-angles, or a continuous ground hold. RA/DEC sky targets move relative to the ground
-as time passes (Earth rotates about 0.0042 degrees per second); there can be drift
-during the slew, and firmware may enable tracking afterward. For precise fixed
-ground pointing, an external controller must refresh the mapping, verify arrival,
-and manage tracking/corrections. No physical pointing accuracy or collision-free
-path is inferred from a successful acknowledgment.
-
 ## Verification
 
 ```bash
@@ -293,14 +471,14 @@ path is inferred from a successful acknowledgment.
 ```
 
 Tests use a pseudo-terminal mount emulator, including failure responses, timeouts,
-coordinate validation, and concurrent command framing. Offline mapping tests cover
-known sky directions, both hemispheres, angle wrapping, singularities, and 200
-round trips. Simulated +5/-5 degree yaw verifies target command signs. Tests never
-open the physical mount; horizon targeting has only been tested offline.
+coordinate validation, and concurrent command framing. Tests never open the
+physical mount.
 Controller tests additionally exercise the +5/0/-5/0 joint sequence, branch
 crossings, bounded speed, invalid targets, stale feedback, reversed motion,
 stalls, cancellation, and exception cleanup. No physical hardware was accessed
-while implementing or testing this controller. Live control is not yet validated.
+by the offline test suite. Separate supervised commissioning verified the blocking
+joint controller, including a return to baseline with a 3°/s cap. The streaming
+worker lifecycle has not yet been physically validated.
 Earlier read-only hardware verification identified `AM5N`, firmware `1.6.3`;
 the firmware getter is `:GV#` (corrected from `:GVN#`).
 

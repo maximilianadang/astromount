@@ -1,0 +1,100 @@
+{
+  "captured_at_utc": "2026-09-11T17:32:31.738777+00:00",
+  "identity": {
+    "model": "AM5N",
+    "firmware": "1.6.3"
+  },
+  "interpretation": "Save the current physical zero pose as a new baseline; never commands motion.\n\nFirst restore the agreed pose: telescope forward, upper motor axis vertical,\nfixed manual adjustments unchanged. This captures coordinates, not physical\nhoming or a new kinematic calibration. Existing motor/FRD signs are not measured.\n",
+  "samples": [
+    {
+      "status_before": {
+        "command": ":GU#",
+        "response": "nNG000000990"
+      },
+      "sidereal_before": {
+        "command": ":GS#",
+        "response": "00:20:41"
+      },
+      "equatorial": {
+        "command": ":GMEQ#",
+        "response": "06:16:32&+82*14:37"
+      },
+      "sidereal_after": {
+        "command": ":GS#",
+        "response": "00:20:41"
+      },
+      "status_after": {
+        "command": ":GU#",
+        "response": "nNG000000990"
+      }
+    },
+    {
+      "status_before": {
+        "command": ":GU#",
+        "response": "nNG000000990"
+      },
+      "sidereal_before": {
+        "command": ":GS#",
+        "response": "00:20:42"
+      },
+      "equatorial": {
+        "command": ":GMEQ#",
+        "response": "06:16:32&+82*14:37"
+      },
+      "sidereal_after": {
+        "command": ":GS#",
+        "response": "00:20:42"
+      },
+      "status_after": {
+        "command": ":GU#",
+        "response": "nNG000000990"
+      }
+    },
+    {
+      "status_before": {
+        "command": ":GU#",
+        "response": "nNG000000990"
+      },
+      "sidereal_before": {
+        "command": ":GS#",
+        "response": "00:20:42"
+      },
+      "equatorial": {
+        "command": ":GMEQ#",
+        "response": "06:16:32&+82*14:37"
+      },
+      "sidereal_after": {
+        "command": ":GS#",
+        "response": "00:20:42"
+      },
+      "status_after": {
+        "command": ":GU#",
+        "response": "nNG000000990"
+      }
+    }
+  ],
+  "queries": {
+    "status_before": {
+      "command": ":GU#",
+      "response": "nNG000000990"
+    },
+    "sidereal_before": {
+      "command": ":GS#",
+      "response": "00:20:42"
+    },
+    "equatorial": {
+      "command": ":GMEQ#",
+      "response": "06:16:32&+82*14:37"
+    },
+    "sidereal_after": {
+      "command": ":GS#",
+      "response": "00:20:42"
+    },
+    "status_after": {
+      "command": ":GU#",
+      "response": "nNG000000990"
+    }
+  },
+  "finished_at_utc": "2026-09-11T17:32:32.417315+00:00",
+  "port": "/dev/serial/by-id/usb-ZWO_Systems_ZWO_Device_123456-if00"
+}

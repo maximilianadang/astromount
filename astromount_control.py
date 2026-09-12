@@ -8,11 +8,17 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
 
-from astromount import Mount, _angle
+from astromount import Mount, decode_coordinates
 
 
 class ControlError(RuntimeError):
     """Control cannot continue; the run attempts to stop before propagating errors."""
+
+
+def require_status(status, *, stationary=False):
+    """Shared control/capture preflight; this does not send commands."""
+    if not all(c in status for c in ('nNG' if stationary else 'nG')) or any(c in status for c in 'ZLSsTt'):
+        raise ControlError(f'Require EQ mode, tracking off, no faults{" and stationary" if stationary else ""}: {status!r}')
 
 
 def _wrap(angle):
@@ -41,15 +47,12 @@ class Reference:
         The original +90 DEC baseline uses the default branch. This does not
         establish physical homing, direction polarity, or validity after reboot.
         """
-        data = json.loads(Path(path).read_text())["queries"]
-        ra, dec = data["equatorial"]["response"].split("&")
-        before = _angle(data["sidereal_before"]["response"], ra=True)
-        after = _angle(data["sidereal_after"]["response"], ra=True)
-        delta = (after - before) % 24
-        if delta > 2 / 3600:
-            raise ValueError("Baseline clock bracket is inconsistent")
-        h = _wrap(15 * (before + delta / 2 - _angle(ra, ra=True)))
-        d = _angle(dec, ra=False)
+        return cls.from_queries(json.loads(Path(path).read_text())["queries"], beyond_pole=beyond_pole)
+
+    @classmethod
+    def from_queries(cls, data, *, beyond_pole=False):
+        """Decode a clock-bracketed baseline without filesystem access."""
+        h, d = decode_coordinates(data)
         return cls(_wrap(h - 180), _wrap(180 - d)) if beyond_pole else cls(h, d)
 
     def offsets(self, hour_angle, declination, previous=(0.0, 0.0)):
@@ -65,7 +68,7 @@ class Reference:
 class Settings:
     kp: float = 0.5                 # (deg/s) per degree of error
     max_speed: float = 0.1          # deg/s, common cap for either axis
-    deadband: float = 0.02          # degrees
+    deadband: float = 0.01          # degrees
     excursion: float = 22.5         # degrees from Reference on each axis
     margin: float = 0.25            # stop inside excursion boundary
     period: float = 0.1             # seconds; requested sampling period
@@ -101,9 +104,23 @@ class State:
     def angles(self):
         return self.ra_degrees, self.dec_degrees
 
+    def pointing(self, frame):
+        """Model-estimated fixed-root az/el from measured joints, in degrees."""
+        return frame.forward(*self.angles)
+
+
+def duration_settings(settings, current, target, duration):
+    """Settings for a nominal move duration; arrival still requires settling."""
+    if not math.isfinite(duration) or duration <= 0: raise ValueError('Duration must be finite and positive')
+    require_status(current.status, stationary=True)
+    distance = max(abs(a-b) for a, b in zip(target, current.angles))
+    speed = min(3, distance / duration) if distance > settings.deadband else settings.max_speed
+    if speed < .01 * (360 / 86164.0905): raise ValueError('Duration demands a speed below firmware resolution')
+    return replace(settings, max_speed=speed, timeout=duration + settings.timeout)
+
 
 class Controller:
-    """One-axis-at-a-time velocity control using shared firmware slew speed.
+    """Concurrent two-axis P control with axis-local rate updates.
 
     positive_directions must be calibrated for increasing model RA/DEC, not sky
     RA or screen directions. Own the Mount for a run; do not use another client.
@@ -117,8 +134,9 @@ class Controller:
         self.mount, self.reference, self.settings = mount, reference, settings
         self.positive_directions = tuple(positive_directions)
         self._previous = None
-        self._action = None
-        self._progress = None
+        self._action = [0.0, 0.0]
+        self._progress = [None, None]
+        self._interval_motion = [False, False]  # Commanded motion since the last accepted sample.
 
     def read(self) -> State:
         """Read and check estimated joint offsets; sends getters only."""
@@ -128,8 +146,7 @@ class Controller:
         s = self.settings
         if end - start > s.max_sample_age:
             raise ControlError("Position transaction exceeded max_sample_age")
-        if "G" not in status or "Z" in status or "n" not in status or any(c in status for c in "LSsTt"):
-            raise ControlError(f"Require EQ mode, tracking off, no stall/low-voltage/guiding: {status!r}")
+        require_status(status)
         old = self._previous
         angles = self.reference.offsets(h, d, old.angles if old else (0, 0))
         if any(abs(v) >= s.excursion - s.margin for v in angles):
@@ -138,46 +155,53 @@ class Controller:
             # Reject discontinuities, wrong-axis motion and gross overspeed.
             allowance = s.max_speed * (end - old.started_at) * 1.1 + s.deadband
             for axis, (new, previous) in enumerate(zip(angles, old.angles)):
-                bound = allowance if self._action and self._action[0] == axis else s.deadband
+                bound = allowance if self._interval_motion[axis] else s.deadband
                 if abs(new - previous) > bound:
-                    raise ControlError("Unexpected axis displacement or coordinate discontinuity")
-        if self._action and self._progress:
-            axis, velocity = self._action
-            direction_origin, origin, since = self._progress
+                    raise ControlError(f"Unexpected axis displacement or coordinate discontinuity: axis={axis}, "
+                                       f"previous={previous:.6f}, measured={new:.6f}, bound={bound:.6f}, "
+                                       f"interval_motion={self._interval_motion[axis]}, command={self._action[axis]:.6f}, "
+                                       f"elapsed={end-old.started_at:.6f}, status={status}")
+        for axis, velocity in enumerate(self._action):
+            if not velocity or self._progress[axis] is None:
+                continue
+            direction_origin, origin, since = self._progress[axis]
             progress = (angles[axis] - direction_origin) * (1 if velocity > 0 else -1)
             if progress < -s.deadband:
                 raise ControlError("Motion opposes the calibrated command direction")
-            if max(abs(a-b) for a, b in zip(angles, origin)) >= s.deadband:
-                self._progress = (angles[axis], angles, end)
+            if abs(angles[axis] - origin) >= s.deadband:
+                self._progress[axis] = (angles[axis], angles[axis], end)
             elif end - since > s.progress_timeout:
                 raise ControlError("No measurable progress; feedback or motion may have stalled")
         state = State(*angles, start, end, status)
         self._previous = state
+        self._interval_motion = [bool(v) for v in self._action]
         return state
 
     def _drive(self, action, permit=lambda: True):
-        if not permit():
-            return False
-        if action == self._action:
-            return True
-        previous_action = self._action
-        self.mount.stop()  # Do not assume a new shared rate affects an active axis.
-        self._action = None
-        if action:
-            if not permit():  # Stop I/O may have outlived the target or lease.
-                return False
-            axis, velocity = action
-            if not previous_action or previous_action[0] != axis or previous_action[1] * velocity <= 0:
-                origin, since = self._progress[1:] if self._progress else (self._previous.angles, monotonic())
-                self._progress = (self._previous.angles[axis], origin, since)
-            direction = self.positive_directions[axis]
-            if velocity < 0:
-                direction = {"east": "west", "west": "east", "north": "south", "south": "north"}[direction]
-            self.mount.jog(direction, speed_degrees_s=abs(velocity))
-            self._action = action
-        else:
-            self._progress = None
+        if not permit(): return False
+        for axis, velocity in enumerate(action):
+            previous = self._action[axis]
+            if velocity == previous: continue
+            if not permit(): return False
+            if previous:
+                self.mount.stop(self._direction(axis, previous))
+                self._action[axis] = 0.0
+            if velocity:
+                if not permit():  # Stop/other-axis I/O may outlive the target or lease.
+                    return False
+                if not previous or previous * velocity <= 0:
+                    origin, since = self._progress[axis][1:] if self._progress[axis] else (self._previous.angles[axis], monotonic())
+                    self._progress[axis] = (self._previous.angles[axis], origin, since)
+                self._interval_motion[axis] = True  # Preserve even if dispatch fails or restart is cancelled later.
+                self.mount.jog(self._direction(axis, velocity), speed_degrees_s=abs(velocity))
+                self._action[axis] = velocity
+            else:
+                self._progress[axis] = None
         return True
+
+    def _direction(self, axis, velocity):
+        direction = self.positive_directions[axis]
+        return direction if velocity > 0 else {"east": "west", "west": "east", "north": "south", "south": "north"}[direction]
 
     def _stop(self):
         """Best-effort stop even if a framing/transport error closed the port."""
@@ -191,7 +215,7 @@ class Controller:
         except Exception as exc:
             raise ControlError("Stop transmission failed; use the physical E-stop") from exc
         finally:
-            self._action = self._progress = None
+            self._action, self._progress = [0.0, 0.0], [None, None]
 
     def _target(self, ra_degrees, dec_degrees):
         target, s = (ra_degrees, dec_degrees), self.settings
@@ -201,13 +225,18 @@ class Controller:
 
     def _step(self, target, state, permit=lambda: True):
         s = self.settings
-        if monotonic() - state.started_at > s.max_sample_age:
-            raise ControlError("State became stale")
+        def fresh_permit():
+            if monotonic() - state.started_at > s.max_sample_age:
+                raise ControlError("State became stale")
+            return permit()
         error = tuple(t - p for t, p in zip(target, state.angles))
-        axis = max(range(2), key=lambda i: abs(error[i]))
-        velocity = 0 if abs(error[axis]) <= s.deadband else max(-s.max_speed, min(s.max_speed, s.kp * error[axis]))
-        applied = self._drive((axis, velocity) if velocity else None, permit)
-        return applied and not velocity and "N" in state.status
+        velocities = tuple(0 if abs(e) <= s.deadband else max(-s.max_speed, min(s.max_speed, s.kp * e)) for e in error)
+        return self._drive(velocities, fresh_permit) and not any(velocities) and "N" in state.status
+
+    def run_pointing(self, frame, *, azimuth, elevation, on_sample=None, cancel=None):
+        """Reach a fixed-root az/el target with concurrent joint control."""
+        lower, upper = frame.inverse(azimuth, elevation)
+        return self.run(ra_degrees=lower, dec_degrees=upper, on_sample=on_sample, cancel=cancel)
 
     def run(self, *, ra_degrees: float, dec_degrees: float, on_sample=None, cancel=None) -> State:
         """Reach absolute offsets from reference. Returns after stationary settling.
@@ -217,28 +246,26 @@ class Controller:
         """
         target, s = self._target(ra_degrees, dec_degrees), self.settings
         with self.mount._lock:
-            self._previous = self._action = None
+            self._previous = None
+            self._action, self._progress = [0.0, 0.0], [None, None]
             deadline, tick, settled = monotonic() + s.timeout, monotonic(), 0
             first = True
+            def permit():
+                if cancel is not None and cancel.is_set():
+                    raise ControlError("Cancelled")
+                if monotonic() >= deadline:
+                    raise ControlError("Target timed out")
+                return True
             try:
                 while True:
-                    if cancel is not None and cancel.is_set():
-                        raise ControlError("Cancelled")
-                    if monotonic() >= deadline:
-                        raise ControlError("Target timed out")
+                    permit()
                     state = self.read()
                     if first and "N" not in state.status:
                         raise ControlError("Mount must be stationary before starting control")
                     first = False
-                    if on_sample:
-                        on_sample(state)
-                    if monotonic() - state.started_at > s.max_sample_age or monotonic() >= deadline:
-                        raise ControlError("State became stale or deadline expired")
-                    if cancel is not None and cancel.is_set():
-                        raise ControlError("Cancelled")
-                    settled = settled + 1 if self._step(target, state) else 0
-                    if settled >= s.settle_samples:
-                        return state
+                    if on_sample: on_sample(state)
+                    settled = settled + 1 if self._step(target, state, permit) else 0
+                    if settled >= s.settle_samples: return state
                     tick = max(tick + s.period, monotonic())
                     sleep(max(0, tick - monotonic()))
             finally:
@@ -301,11 +328,9 @@ class Worker:
             self._thread.start()
         return self
 
-    def __enter__(self):
-        return self.start()
+    def __enter__(self): return self.start()
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, *exc): self.close()
 
     @property
     def snapshot(self):
@@ -349,6 +374,14 @@ class Worker:
             if self._snapshot.mode not in (Lifecycle.NEW, Lifecycle.CLOSING, Lifecycle.CLOSED):
                 self._snapshot = replace(self._snapshot, mode=Lifecycle.STOPPING, target=None, arrived=False)
         self._wake.set()
+
+    def arm_pointing(self, frame, *, azimuth, elevation, issued_at=None):
+        """Arm using fixed-root az/el degrees and an explicitly configured frame."""
+        return self._publish(*frame.inverse(azimuth, elevation), issued_at, True)
+
+    def set_pointing(self, frame, *, azimuth, elevation, issued_at=None):
+        """Replace latest az/el target and heartbeat; no serial I/O or queue."""
+        return self._publish(*frame.inverse(azimuth, elevation), issued_at, False)
 
     def close(self, timeout=3):
         with self._lock:

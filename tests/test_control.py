@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 
 from astromount_control import Controller, ControlError, Reference, Settings
+from astromount_kinematics import Pointing
+from astromount import decode_coordinates, ProtocolError
 from test_astromount import simulated
 
 
@@ -40,20 +42,34 @@ class Plant:
             h, d = h+180, 180-d
         return (h+180)%360-180, d, self.flags + ("N" if not any(self.velocity) else "")
 
-    def stop(self):
+    def stop(self, direction=None):
         self.integrate()
-        self.velocity = [0.0, 0.0]
-        self.commands.append(("stop",))
+        if direction is None:
+            self.velocity = [0.0, 0.0]
+        else:
+            self.velocity[0 if direction in ('east', 'west') else 1] = 0.0
+        self.commands.append(("stop",) if direction is None else ("stop", direction))
 
     def jog(self, direction, *, speed_degrees_s):
         self.integrate()
         axis = 0 if direction in ("east", "west") else 1
-        assert not any(self.velocity), "Shared speed changed during active movement"
+        assert not self.velocity[axis], "Changing axis must be stopped before restart"
         self.velocity[axis] = speed_degrees_s * (1 if direction in ("west", "north") else -1)
         self.commands.append((direction, speed_degrees_s))
 
 
 class ControlTests(unittest.TestCase):
+    def test_live_and_saved_coordinates_share_decoder(self):
+        def queries(before='23:59:59', after='00:00:00', eq='06:00:00&+90*00:00'):
+            return {k: {'response': v} for k,v in zip(('sidereal_before','sidereal_after','equatorial'), (before,after,eq))}
+        data = queries()
+        self.assertEqual(Reference.from_queries(data).angles, decode_coordinates(data))
+        self.assertAlmostEqual(decode_coordinates(data)[0], -90-15/7200)
+        for invalid in (queries(after='00:00:05'), queries(eq='invalid'), queries(eq='24:00:00&+90*00:00')):
+            for decode in (decode_coordinates, Reference.from_queries):
+                with self.assertRaises(ProtocolError):
+                    decode(invalid)
+
     def setUp(self):
         self.clock = Clock()
         self.patches = [patch("astromount_control.monotonic", lambda: self.clock.now),
@@ -67,15 +83,90 @@ class ControlTests(unittest.TestCase):
     def test_sequence_crosses_pole_and_returns_to_same_zero(self):
         for dec in (5, 0, -5, 0):
             state = self.controller.run(ra_degrees=0, dec_degrees=dec)
-            self.assertLessEqual(abs(state.dec_degrees-dec), 0.02)
+            self.assertLessEqual(abs(state.dec_degrees-dec), self.controller.settings.deadband)
             self.assertEqual(state.ra_degrees, 0)
         self.assertFalse(any(self.plant.velocity))
-        self.assertTrue(all(c[1] <= 0.1 for c in self.plant.commands if len(c) == 2))
+        self.assertTrue(all(c[1] <= 0.1 for c in self.plant.commands if c[0] != 'stop'))
 
     def test_two_axis_target(self):
         state = self.controller.run(ra_degrees=1, dec_degrees=-2)
         for actual, target in zip(state.angles, (1, -2)):
-            self.assertLessEqual(abs(actual-target), 0.02)
+            self.assertLessEqual(abs(actual-target), self.controller.settings.deadband)
+
+    def test_combined_azel_converges_with_overlapping_motion(self):
+        frame, velocities = Pointing(1, -1), []
+        state = self.controller.run_pointing(frame, azimuth=2, elevation=1,
+                                            on_sample=lambda s: velocities.append(tuple(self.plant.velocity)))
+        self.assertTrue(any(all(v) for v in velocities))
+        for actual, target in zip(state.pointing(frame), (2, 1)):
+            self.assertAlmostEqual(actual, target, delta=.04)
+        self.assertEqual(self.plant.velocity, [0, 0])
+
+    def test_axis_local_updates_preserve_other_velocity(self):
+        c = self.controller
+        c.read()
+        c._drive((.05, .1))
+        for desired, stops in (((.025, .1), ['west']), ((-.025, .1), ['west']),
+                               ((-.025, 0), ['north']), ((0, 0), ['east'])):
+            self.plant.commands.clear()
+            c._drive(desired)
+            self.assertEqual(tuple(self.plant.velocity), desired)
+            self.assertEqual([x[1] for x in self.plant.commands if x[0] == 'stop'], stops)
+        self.plant.commands.clear()
+        c._drive((0, 0))
+        self.assertEqual(self.plant.commands, [])
+
+    def test_partner_progress_does_not_hide_one_stalled_axis(self):
+        for stuck_axis in (0, 1):
+            with self.subTest(axis=stuck_axis):
+                plant = Plant(self.clock)
+                integrate = plant.integrate
+                def stalled():
+                    old = plant.q[stuck_axis]
+                    integrate()
+                    plant.q[stuck_axis] = old
+                plant.integrate = stalled
+                c = Controller(plant, Reference(-90, 90), positive_directions=('west', 'north'),
+                               settings=replace(Settings(), progress_timeout=.6))
+                with self.assertRaisesRegex(ControlError, 'No measurable progress'):
+                    c.run(ra_degrees=1, dec_degrees=1)
+                self.assertGreater(abs(plant.q[1-stuck_axis]), .02)
+                self.assertFalse(any(plant.velocity))
+
+    def test_cancel_or_stale_state_between_axis_starts_stops_both(self):
+        for stale in (False, True):
+            with self.subTest(stale=stale):
+                cancel = Event()
+                original = self.plant.jog
+                def first_axis(*args, **kwargs):
+                    original(*args, **kwargs)
+                    self.clock.sleep(.3) if stale else cancel.set()
+                self.plant.commands.clear()
+                with patch.object(self.plant, 'jog', first_axis):
+                    with self.assertRaisesRegex(ControlError, 'stale' if stale else 'Cancelled'):
+                        self.controller.run(ra_degrees=1, dec_degrees=1, cancel=cancel)
+                self.assertEqual([x[0] for x in self.plant.commands if x[0] != 'stop'], ['west'])
+                self.assertFalse(any(self.plant.velocity))
+
+    def test_second_axis_dispatch_failure_globally_stops(self):
+        original = self.plant.jog
+        def fail_second(direction, **kwargs):
+            if direction == 'north':
+                raise OSError('Second axis write failed')
+            original(direction, **kwargs)
+        with patch.object(self.plant, 'jog', fail_second):
+            with self.assertRaisesRegex(OSError, 'Second axis'):
+                self.controller.run(ra_degrees=1, dec_degrees=1)
+        self.assertFalse(any(self.plant.velocity))
+        self.assertEqual(self.plant.commands[-1], ('stop',))
+
+    def test_serial_direction_local_stops(self):
+        with simulated([(b':Qw#', b''), (b':Qs#', b''), (b':Q#', b'')]) as mount:
+            with self.assertRaises(ValueError):
+                mount.stop('invalid')
+            mount.stop('west')
+            mount.stop('south')
+            mount.stop()
 
     def test_saved_measurements_reconstruct_offsets(self):
         root = Path(__file__).resolve().parents[1]
@@ -142,9 +233,61 @@ class ControlTests(unittest.TestCase):
         self.assertFalse(any(self.plant.velocity))
 
     def test_settings_validation(self):
+        self.assertEqual(Settings().deadband, .01)
         for args in ({"kp": 0}, {"max_speed": 7}, {"max_speed": 1}, {"margin": 23}, {"deadband": 0.5}, {"settle_samples": True}):
             with self.assertRaises(ValueError):
                 Settings(**args)
+
+    def test_cancelled_restart_accounts_for_motion_before_stop(self):
+        for axis in (0, 1):
+            with self.subTest(axis=axis):
+                plant = Plant(self.clock)
+                c = Controller(plant, Reference(-90, 90), positive_directions=('west', 'north'),
+                               settings=Settings(max_speed=1, margin=1.25))
+                velocity = [0, 0]
+                velocity[axis] = -.7
+                c.read()
+                c._drive(velocity)
+                self.clock.sleep(.1)
+                before = c.read()
+                self.clock.sleep(.04)
+                velocity[axis] = -.65
+                permits = iter((True, True, False))
+                self.assertFalse(c._drive(velocity, lambda: next(permits)))
+                self.assertEqual(c._action[axis], 0)
+                after = c.read()
+                self.assertGreater(abs(after.angles[axis]-before.angles[axis]), c.settings.deadband)
+                # Once the transition interval is consumed, idle checks tighten again.
+                plant.q[axis] += .02
+                with self.assertRaisesRegex(ControlError, 'interval_motion=False'):
+                    c.read()
+
+    def test_start_stop_between_samples_and_global_stop_preserve_interval(self):
+        for global_stop in (False, True):
+            with self.subTest(global_stop=global_stop):
+                plant = Plant(self.clock)
+                c = Controller(plant, Reference(-90, 90), positive_directions=('west', 'north'),
+                               settings=Settings(max_speed=1, margin=1.25))
+                c.read()
+                c._drive((.7, -.7))
+                self.clock.sleep(.04)
+                c._stop() if global_stop else c._drive((0, 0))
+                state = c.read()
+                self.assertAlmostEqual(state.angles[0], .028)
+                self.assertAlmostEqual(state.angles[1], -.028)
+                self.assertEqual(c._interval_motion, [False, False])
+
+    def test_interval_allowance_is_bounded_and_rejected_sample_is_not_consumed(self):
+        c = self.controller
+        c.read()
+        c._drive((.1, 0))
+        self.clock.sleep(.1)
+        c._drive((0, 0))
+        self.plant.q[0] += 1
+        with self.assertRaisesRegex(ControlError, 'axis=0.*measured=.*bound=.*interval_motion=True'):
+            c.read()
+        self.assertTrue(c._interval_motion[0])
+        self.assertEqual(c._previous.angles, (0, 0))
 
     def test_serial_velocity_and_combined_read(self):
         with simulated([(b":Rv23.93#", b""), (b":Mn#", b""),

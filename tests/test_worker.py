@@ -6,6 +6,7 @@ import unittest
 
 from astromount_control import Controller, ControlError, Lifecycle, Reference, Settings, Worker
 from test_control import Plant
+from astromount_kinematics import Pointing
 
 
 class RealClock:
@@ -37,9 +38,9 @@ class ThreadPlant(Plant):
         self.owners.add(get_ident())
         super().jog(*args, **kwargs)
 
-    def stop(self):
+    def stop(self, direction=None):
         self.owners.add(get_ident())
-        super().stop()
+        super().stop(direction)
 
 
 class WorkerTests(unittest.TestCase):
@@ -68,6 +69,35 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(any(self.plant.velocity))
         self.assertEqual(len(self.plant.owners), 1)
         self.assertNotIn(get_ident(), self.plant.owners)
+
+    def test_pointing_starts_both_axes_and_heartbeat_stops_both(self):
+        self.worker.arm_pointing(Pointing(1, -1), azimuth=1, elevation=1)
+        self.wait_for(lambda: all(self.plant.velocity))
+        self.assertGreater(self.plant.velocity[0], 0)
+        self.assertLess(self.plant.velocity[1], 0)
+        self.wait_for(lambda: self.worker.snapshot.mode == Lifecycle.FAULT)
+        self.assertIn('Heartbeat', self.worker.snapshot.fault)
+        self.assertFalse(any(self.plant.velocity))
+        self.assertEqual(len(self.plant.owners), 1)
+
+    def test_replacement_between_axis_starts_cancels_second_old_command(self):
+        entered, release = Event(), Event()
+        original = self.plant.jog
+        def jog(direction, **kwargs):
+            original(direction, **kwargs)
+            if direction == 'west':
+                entered.set()
+                if not release.wait(1):
+                    raise RuntimeError('Test gate timed out')
+        self.plant.jog = jog
+        self.addCleanup(release.set)
+        self.worker.arm(ra_degrees=1, dec_degrees=1)
+        self.assertTrue(entered.wait(.5))
+        seq = self.worker.set_target(ra_degrees=-1, dec_degrees=-1)
+        release.set()
+        self.wait_for(lambda: all(v < 0 for v in self.plant.velocity))
+        self.assertNotIn('north', [c[0] for c in self.plant.commands])
+        self.assertEqual(self.worker.snapshot.applied.sequence, seq)
 
     def test_heartbeat_latches_and_requires_explicit_arm(self):
         self.worker.arm(ra_degrees=0, dec_degrees=1)
@@ -220,13 +250,16 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNone(self.worker.snapshot.applied)
 
     def test_stop_during_speed_change_stop_prevents_restart(self):
-        entered, release = self.pause(self.plant, 'stop')
         self.worker.arm(ra_degrees=0, dec_degrees=1)
+        self.wait_for(lambda: any(self.plant.velocity))
+        entered, release = self.pause(self.plant, 'stop')
+        before = len(self.plant.commands)
+        self.worker.set_target(ra_degrees=0, dec_degrees=-1)
         self.assertTrue(entered.wait(.5))
         self.worker.stop()
         release.set()
         self.wait_for(lambda: self.worker.snapshot.mode == Lifecycle.DISARMED)
-        self.assertTrue(all(c[0] == 'stop' for c in self.plant.commands))
+        self.assertTrue(all(c[0] == 'stop' for c in self.plant.commands[before:]))
 
     def test_shutdown_between_measurement_and_dispatch_prevents_jog(self):
         entered, release = self.pause(self.control, '_step')
@@ -256,14 +289,17 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(all(c[0] in ('stop', 'south') for c in self.plant.commands))
 
     def test_expiry_during_stop_io_prevents_restart(self):
-        entered, release = self.pause(self.plant, 'stop')
         self.worker.arm(ra_degrees=0, dec_degrees=1)
+        self.wait_for(lambda: any(self.plant.velocity))
+        entered, release = self.pause(self.plant, 'stop')
+        before = len(self.plant.commands)
+        self.worker.set_target(ra_degrees=0, dec_degrees=-1)
         self.assertTrue(entered.wait(.5))
         sleep(.16)
         release.set()
         self.wait_for(lambda: self.worker.snapshot.mode == Lifecycle.FAULT)
         self.assertIn('Heartbeat', self.worker.snapshot.fault)
-        self.assertTrue(all(c[0] == 'stop' for c in self.plant.commands))
+        self.assertTrue(all(c[0] == 'stop' for c in self.plant.commands[before:]))
 
     def test_fault_monitors_without_restarting_and_stop_does_not_clear_fault(self):
         self.worker.arm(ra_degrees=0, dec_degrees=1)

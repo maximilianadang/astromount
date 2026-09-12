@@ -21,47 +21,6 @@ class Position:
     finished_at: float
 
 
-@dataclass(frozen=True)
-class PointingFrame:
-    """Instantaneous geometric horizon frame for an aligned equatorial mount.
-
-    Supply local sidereal time (not civil time) at the position/target epoch.
-    Azimuth is clockwise from true north; altitude is above the horizon.
-    No refraction, alignment-error correction, or automatic clock advancement.
-    """
-
-    latitude_degrees: float
-    sidereal_hours: float
-
-    def __post_init__(self):
-        if not math.isfinite(self.latitude_degrees) or not -90 <= self.latitude_degrees <= 90:
-            raise ValueError("latitude_degrees must be finite and in [-90, 90]")
-        if not math.isfinite(self.sidereal_hours) or not 0 <= self.sidereal_hours < 24:
-            raise ValueError("sidereal_hours must be finite and in [0, 24)")
-
-    def _rotate(self, longitude: float, latitude: float) -> tuple[float, float]:
-        # This orthogonal transform is its own inverse: hour angle/DEC <-> az/alt.
-        if not math.isfinite(longitude) or not math.isfinite(latitude) or not -90 <= latitude <= 90:
-            raise ValueError("Angles must be finite; latitude/altitude must be in [-90, 90]")
-        lon, lat, pole = map(math.radians, (longitude % 360, latitude, self.latitude_degrees))
-        x, y, z = math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)
-        x, y, z = -math.sin(pole) * x + math.cos(pole) * z, -y, math.cos(pole) * x + math.sin(pole) * z
-        if math.hypot(x, y) < 1e-12:
-            raise ValueError("Pointing is singular at the zenith/nadir or celestial pole")
-        return math.degrees(math.atan2(y, x)) % 360, math.degrees(math.atan2(z, math.hypot(x, y)))
-
-    def horizontal(self, *, ra_hours: float, dec_degrees: float) -> tuple[float, float]:
-        """Return (azimuth_degrees, altitude_degrees) without device I/O."""
-        if not math.isfinite(ra_hours) or not 0 <= ra_hours < 24:
-            raise ValueError("ra_hours must be finite and in [0, 24)")
-        return self._rotate(15 * (self.sidereal_hours - ra_hours), dec_degrees)
-
-    def equatorial(self, *, azimuth_degrees: float, altitude_degrees: float) -> tuple[float, float]:
-        """Return (ra_hours, dec_degrees); finite azimuths wrap at 360 degrees."""
-        hour_angle, dec = self._rotate(azimuth_degrees, altitude_degrees)
-        return (self.sidereal_hours - hour_angle / 15) % 24, dec
-
-
 def _angle(text: str, *, ra: bool) -> float:
     pattern = r"(\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?" if ra else r"([+-]\d{2})\*(\d{2})(?::(\d{2}(?:\.\d+)?))?"
     match = re.fullmatch(pattern, text)
@@ -88,6 +47,20 @@ def _sexagesimal(value: float, *, ra: bool) -> str:
     return f"{sign}{major:02d}{separator}{minutes:02d}:{seconds:02d}"
 
 
+def decode_coordinates(queries):
+    """Decode a saved/live clock bracket into hour angle and declination (degrees)."""
+    before = _angle(queries['sidereal_before']['response'], ra=True)
+    after = _angle(queries['sidereal_after']['response'], ra=True)
+    coordinates = queries['equatorial']['response'].split('&')
+    if len(coordinates) != 2:
+        raise ProtocolError('Invalid combined coordinate response')
+    ra, dec = _angle(coordinates[0], ra=True), _angle(coordinates[1], ra=False)
+    elapsed = (after - before) % 24
+    if elapsed > 2 / 3600:
+        raise ProtocolError('Firmware clock changed during position read')
+    return (15 * (before + elapsed / 2 - ra) + 180) % 360 - 180, dec
+
+
 class Mount:
     """Own one connection. Opening and closing never send mount commands.
 
@@ -104,11 +77,9 @@ class Mount:
             port, baudrate, timeout=timeout, write_timeout=timeout, exclusive=True
         )
 
-    def __enter__(self):
-        return self
+    def __enter__(self): return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, *exc): self.close()
 
     def close(self) -> None:
         """Release the port; does not stop movement or change tracking."""
@@ -178,24 +149,16 @@ class Mount:
         """Raw firmware status flags: N = not slewing, H = home, G/Z = EQ/alt-az."""
         return self._command(":GU#")
 
-    def joint_sample(self) -> tuple[float, float, str]:
-        """Return sky hour angle (degrees), DEC and status; no configuration writes.
-
-        Bracket the combined position read with the firmware's sidereal clock.
-        The controller supplies mechanical branch reconstruction and timing checks.
-        """
+    def coordinate_queries(self):
+        """Read one atomic clock bracket, retaining raw responses for baseline capture."""
         with self._lock:
-            before = _angle(self._command(":GS#"), ra=True)
-            coordinates = self._command(":GMEQ#").split("&")
-            if len(coordinates) != 2:
-                raise ProtocolError("Invalid combined coordinate response")
-            ra, dec = _angle(coordinates[0], ra=True), _angle(coordinates[1], ra=False)
-            after = _angle(self._command(":GS#"), ra=True)
-            elapsed = (after - before) % 24
-            if elapsed > 2 / 3600:
-                raise ProtocolError("Firmware clock changed during position read")
-            hour_angle = (15 * (before + elapsed / 2 - ra) + 180) % 360 - 180
-            return hour_angle, dec, self.status()
+            return {name: {'command': command, 'response': self._command(command)} for name, command in
+                    (('sidereal_before', ':GS#'), ('equatorial', ':GMEQ#'), ('sidereal_after', ':GS#'))}
+
+    def joint_sample(self) -> tuple[float, float, str]:
+        """Read hour angle (degrees), DEC and status; caller reconstructs joint offsets."""
+        with self._lock:
+            return *decode_coordinates(self.coordinate_queries()), self.status()
 
     def tracking(self) -> bool:
         response = self._command(":GAT#")
@@ -220,34 +183,6 @@ class Mount:
             self._accept(f":Sd{dec}#")
             self._command(":MS#", "slew")
 
-    def goto_horizontal(self, frame: PointingFrame, *, azimuth_degrees: float, altitude_degrees: float) -> None:
-        """Dispatch a horizon target converted at frame's epoch, not a ground hold.
-
-        Requires stationary equatorial mode. Completion/tracking semantics match
-        goto(); the horizon direction drifts as the RA/DEC target ages.
-        """
-        ra, dec = frame.equatorial(azimuth_degrees=azimuth_degrees, altitude_degrees=altitude_degrees)
-        with self._lock:
-            status = self.status()
-            if "G" not in status or "Z" in status or "N" not in status:
-                raise ProtocolError("Horizon targeting requires equatorial mode and no active slew")
-            self.goto(ra_hours=ra, dec_degrees=dec)
-
-    def yaw(self, degrees: float, *, frame: PointingFrame) -> None:
-        """Offset reported azimuth, preserving altitude at frame's epoch.
-
-        Positive is clockwise viewed from above. Specifies an endpoint, not a
-        motor path; no guarantee of shortest travel or an exact physical angle.
-        """
-        if not math.isfinite(degrees):
-            raise ValueError("degrees must be finite")
-        if degrees % 360 == 0:
-            return
-        with self._lock:
-            position = self.position()
-            azimuth, altitude = frame.horizontal(ra_hours=position.ra_hours, dec_degrees=position.dec_degrees)
-            self.goto_horizontal(frame, azimuth_degrees=azimuth + degrees, altitude_degrees=altitude)
-
     @staticmethod
     def _direction(direction: str) -> str:
         if direction not in ("north", "south", "east", "west"):
@@ -258,7 +193,7 @@ class Mount:
         """Start continuous motion at firmware speed index 0..9; call stop().
 
         Indices: 0.25, 0.5, 1, 2, 4, 8, 20, 60, 720, 1440 times sidereal.
-        One shared slew-rate setting applies to both axes.
+        The rate selector is shared; direction commands start individual axes.
         """
         direction = self._direction(direction)
         if type(rate) is not int or not 0 <= rate <= 9:
@@ -280,8 +215,9 @@ class Mount:
     def jog(self, direction: str, *, speed_degrees_s: float) -> None:
         """Start directional motion with a positive speed, limited to 6 deg/s.
 
-        Speed is a shared firmware setting. Stop existing motion before changing
-        axis/rate. No acknowledgment or automatic stopping is provided by firmware.
+        Stop the affected axis before changing its rate/direction. On tested AM5N
+        1.6.3 firmware the other axis retains its active rate. No acknowledgment
+        or automatic stopping is provided by firmware.
         """
         direction = self._direction(direction)
         if not math.isfinite(speed_degrees_s) or not 0 < speed_degrees_s <= 6:
@@ -293,9 +229,10 @@ class Mount:
             self._command(f":Rv{rate:.2f}#", "none")
             self._command(f":M{direction}#", "none")
 
-    def stop(self) -> None:
-        """Abort slewing. Tracking is separate: use set_tracking(False)."""
-        self._command(":Q#", "none")
+    def stop(self, direction: str | None = None) -> None:
+        """Stop all slewing, or only the given direction. Does not disable tracking."""
+        suffix = '' if direction is None else self._direction(direction)
+        self._command(f":Q{suffix}#", "none")
 
     def home(self) -> None:
         """Start physical movement to the home sensor reference."""

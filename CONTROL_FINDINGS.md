@@ -6,7 +6,7 @@ There is no fundamental need for a star field or an additional encoder to build
 relative robot control. The controller exposes computed equatorial position,
 its own sidereal clock, a pointing-side indicator, and independent directional
 axis control. A mechanical-coordinate adapter and fixed mounting transform are
-needed. The existing astronomical `PointingFrame` is not that adapter.
+needed.
 
 The photograph shows an approximately horizontal lower/RA axis and a vertical
 upper/DEC axis. With the lower axis fixed there, upper-axis rotation changes
@@ -148,11 +148,9 @@ This is not a claim that no private interface exists. Independent axis motion is
 implemented by the published driver. No new hardware is established as necessary;
 the remaining limitation under the no-motion constraint is physical validation.
 
-## Concrete issues in the current Python API
+## Historical API issues observed during this investigation
 
 - `identity()` uses `:GVN#`; the correct ZWO firmware query is `:GV#` (verified).
-- `PointingFrame`/`yaw()` implement an astronomical horizon frame, not the
-  measured fixed robot geometry. They cannot enforce an upper-only excursion.
 - Joint reconstruction needs sidereal time, branch/reference handling, and
   preferably the combined RA/DEC getter; these are not exposed publicly yet.
 - There is no feedback-based joint target executor or arrival verification.
@@ -162,6 +160,146 @@ the remaining limitation under the no-motion constraint is physical validation.
   one byte. Full error-frame handling needs correction before robust motion use.
 
 These are identified changes, not changes applied by this diagnostic turn.
+
+## Simultaneous variable-rate investigation (2026-09-10; no device commands)
+
+Spiral testing is paused. Separate axis motion is not proof of independent rates.
+ZWO protocol v2.1 documents one `:Rvnnnn.nn#` rate selector, separate `:Mn/s/e/w#`
+starts and `:Qn/s/e/w#` stops, but does not specify per-axis rate retention or
+unaffected-axis behavior during rate changes. INDIGO implements separate axis
+start/stop with a common preset rate; it does not establish unequal concurrent rates.
+
+In [ZWO's manufacturer response](https://bbs.zwoastro.com/d/15709-different-slew-rates),
+ASIMount@ZWO states that RA and DEC must use the same rate at the time of that
+reply. This is evidence against assuming support, not a version-specific test
+of our recorded firmware 1.6.3. ASCOM MoveAxis semantics alone prove nothing about
+this firmware implementation.
+
+Our saved live-rate test measured only DEC: changing Rv alone left its active
+speed unchanged. That suggests possible rate retention, but never tested starting
+the other axis at a different rate, axis-local stops, or cross-axis interference.
+Independent simultaneous velocities therefore remain unverified and are not a
+documented capability we can enable in the controller yet.
+
+Next discriminating experiment, requiring separate supervised motion approval:
+start one axis slowly, start the other at a different slow rate, measure both,
+stop only one and verify the other continues unchanged; repeat with axis order
+reversed. Only after that passes, test rate increase/decrease and reversals while
+the other axis continues. Keep a small measured excursion and global-stop cleanup.
+If supported, replace the single selected action with a two-axis velocity vector,
+axis-local dispatch and per-axis progress checks, preserving the mailbox/heartbeat,
+FK/IK and global fault stop. Do not substitute native goto or upgrade firmware.
+
+### Supervised simultaneous-rate result (2026-09-10)
+
+Executed `probe_simultaneous.py` on AM5N firmware 1.6.3; full samples in
+`simultaneous-rates-2026-09-10.jsonl`. No goto, home, sync or tracking changes.
+Contrary to the conservative documentation-based assumption above, this firmware
+retains different active rates on both axes in this tested sequence:
+
+| Sequence | Lower measured deg/s | Upper measured deg/s |
+| --- | ---: | ---: |
+| West at .05, alone | +.05044 | 0 |
+| Add south at .10 | +.05048 | +.09708 |
+| Stop west only | 0 | +.09743 |
+| North at .05, alone | 0 | -.04992 |
+| Add east at .10 | -.09726 | -.05006 |
+| Stop north only | -.09754 | 0 |
+
+Each phase lasted approximately 1.5 seconds; rates use position differences after
+the first .35 seconds. Global stop and three stationary samples confirmed after
+each trial. Initial baseline-relative joints (+.01667,+.01972); final joints
+(-.12917,+.16722) degrees. Not returned to baseline. Maximum observed displacement
+from the test origin was less than .31 degrees on either axis, inside the .6-degree
+guard. These are firmware-derived measurements, not independent optical metrology.
+
+This validates unequal simultaneous low-speed motion and axis-local stopping in
+both start orders, not live rate updates, reversals with another active axis, or
+high-speed trajectory tracking. Controller remains unchanged and spiral paused.
+
+### Axis-local rate update result (2026-09-10)
+
+Ran `probe_simultaneous.py --rate-updates`; samples saved in
+`simultaneous-rate-updates-2026-09-10.jsonl`. Each trial starts both axes at .05
+deg/s, then changes only the first axis to .10 and .025 using its direction-local
+Q followed immediately by Rv/M. No global stop between phases; no reversals tested.
+
+| Changing axis / phase | Lower measured deg/s | Upper measured deg/s |
+| --- | ---: | ---: |
+| Lower / .05 | +.05020 | +.04995 |
+| Lower / .10 | +.09673 | +.05004 |
+| Lower / .025 | +.02319 | +.04999 |
+| Upper / .05 | -.05048 | -.04996 |
+| Upper / .10 | -.04678 | -.09719 |
+| Upper / .025 | -.04655 | -.02509 |
+
+Supports increasing/decreasing one axis with local stop/restart while the partner
+continues near .05 deg/s. Short-window lower-axis estimates are quantized; these
+are not precision rate measurements or proof of transient-free motion. Both trials
+ended with global stop and three stationary samples. Final baseline-relative joints
+(-.09583,+.13417) degrees; not returned to zero. Controller still unchanged; spiral
+paused. Continuous 10 Hz two-axis updates and in-motion reversals remain untested.
+
+### Adapted combined pointing controller test (2026-09-10)
+
+Executed `probe_pointing.py`, calling the production `Controller.run_pointing`
+with `Pointing(1,-1)`, root az/el (+1,+1), .1 deg/s per-axis cap, 30 s timeout,
+and a reduced joint excursion of 2 degrees (1.75-degree stopping boundary).
+Log: `combined-pointing-2026-09-10.jsonl`. Start joints (-.09583,+.13417).
+IK target joints (+1.0001523,-.9998477); final joints (+.9833333,-.9808333).
+FK-estimated final az/el (+.9809778,+.9831892). Final joint errors
+(-.016819,+.019014) are inside the configured .02-degree deadband.
+
+154 samples at mean 10.002 Hz; longest read .02043 s. Both motors commanded
+concurrently in 143 sampled intervals; measured joint rates during seconds 1–8
+were approximately (+.09723,-.09723) deg/s. Completion and post-stop verification
+took 15.82 s. Three additional reads agreed on stationary final pose, tracking off.
+No return to baseline and no spiral. Near arrival the lower readout alternated
+across the deadband and triggered short corrections before settling; this is not
+evidence of jitter-free tracking. Firmware-derived FK is not independent optical
+verification. This validates one low-speed combined fixed target, not streamed
+trajectory replacement, high-speed motion, or reversal while the partner moves.
+
+### First streamed spiral test: stopped on fault (2026-09-10)
+
+User approved the displayed baseline-centered 5-degree cone, two turns outward
+and two inward over 120 s. Ran production CLI through `probe_spiral.py` with
+1 deg/s per-axis cap and existing worker/heartbeat; full accepted telemetry in
+`spiral-2026-09-10.jsonl`. Preflight stationary, tracking off, baseline-relative
+joints (+.01667,-.01972). Offline suite: 64 tests passing before execution.
+
+Run aborted around 78 seconds with `Unexpected axis displacement or coordinate
+discontinuity`. There were 779 accepted samples at 9.9999 Hz, max read latency
+.01839 s and maximum recorded cone radius 4.55397 degrees. Motion showed lag
+against the requested spiral. The outward leg and part of the inward leg ran;
+the trajectory did not complete and no automatic return/retry was performed.
+
+Worker shutdown attempted global stop. A separate read-only check confirmed five
+stationary status samples (`nNG000000870`), tracking off; final joint readout
+approximately (-.445833,+3.380278), FK az/el (-3.380380,-.445058) degrees.
+Lower readout varied one .004167-degree quantum during that check.
+
+The rejected sample and per-axis command state were not captured by the logging
+wrapper (which records only successful reads). Exact cause is unresolved; do not
+claim an overspeed, a branch jump, or a false guard trigger from this evidence.
+Do not relax the guard or resume the spiral without investigating the failure.
+
+### Displacement interval accounting fixed offline (2026-09-11)
+
+The guard now retains per-axis commanded-motion history since the previous
+accepted sample instead of consulting only the latest velocity command. Starts
+mark the interval active; local/global stops preserve that history. Successful
+reads consume the interval and seed the next from currently commanded motion.
+The existing speed-cap allowance is unchanged; wholly idle intervals still use
+the deadband. Fault messages now include axis, previous/measured positions, bound,
+interval-motion state, current command, elapsed time and firmware status.
+
+Regression tests cover cancellation between local stop/restart on either axis,
+start/stop entirely between reads, global stop, return to strict idle checks,
+bounded rejection and preservation of history on a rejected read. All 71 offline
+tests pass. No hardware commands sent. The original spiral trigger remains an
+inference because its rejected sample was not captured; physical validation of
+this fix and investigation of the later CLI timeout are still outstanding.
 
 ## Sources
 
