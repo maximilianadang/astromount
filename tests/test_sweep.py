@@ -102,3 +102,20 @@ class SweepTests(TestCase):
             self.assertEqual(run.call_args.args[2], [(10,0,1), (0,0,1)])
             self.assertTrue(run.call_args.kwargs['delta'])
             self.assertIs(run.call_args.kwargs['log'], logging.return_value.__enter__.return_value)
+
+    def test_cancel_stops_worker_and_restores_settings(self):
+        import threading
+        stop = threading.Event()
+        control = Mock(settings=Settings())
+        settings = control.settings
+        control.read.return_value = State(0,0,0,0,'nNG')
+        with patch('astromount_trajectory.Worker') as factory:
+            worker = factory.return_value.__enter__.return_value
+            worker.snapshot = SimpleNamespace(fault=None, armed=True, arrived=False)
+            worker.set_pointing.side_effect = lambda *a, **kw: stop.set()
+            with self.assertRaises(InterruptedError): sweep(control, FRAME, [(10,0,1)], cancel=stop)
+            factory.return_value.__exit__.assert_called_once()
+            self.assertIs(control.settings, settings)
+        with patch('astromount_trajectory.Worker') as factory, self.assertRaises(InterruptedError):
+            sweep(control, FRAME, [(10,0,1)], cancel=stop)
+        factory.assert_not_called()

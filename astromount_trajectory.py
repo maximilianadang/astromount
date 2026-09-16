@@ -7,12 +7,13 @@ from time import monotonic, sleep
 from astromount_control import ControlError, Worker, require_status
 
 
-def sweep(control, frame, waypoints, *, delta=False, log=None):
+def sweep(control, frame, waypoints, *, delta=False, log=None, cancel=None):
     """Stream time-interpolated az/el; cumulative deltas, no waypoint stops.
 
     Durations schedule targets, not guaranteed arrival. The caller owns Mount;
     Worker owns serial I/O during streaming and stops on every exit.
     """
+    if cancel is not None and cancel.is_set(): raise InterruptedError('Sweep canceled')
     settings = control.settings
     current = control.read()
     if log: log('initial', state=asdict(current), measured_azel=current.pointing(frame))
@@ -36,6 +37,7 @@ def sweep(control, frame, waypoints, *, delta=False, log=None):
             began, index, final_sent = monotonic(), 0, False
             if log: log('plan', began_monotonic_s=began, segments=segments, settings=asdict(control.settings), heartbeat=worker.heartbeat)
             while True:
+                if cancel is not None and cancel.is_set(): raise InterruptedError('Sweep canceled')
                 now, snapshot = monotonic(), worker.snapshot
                 if log:
                     log('feedback', snapshot=asdict(snapshot),
@@ -52,7 +54,7 @@ def sweep(control, frame, waypoints, *, delta=False, log=None):
                 sequence = worker.set_pointing(frame, azimuth=az, elevation=el, issued_at=now)
                 if log: log('target', issued_at=now, sequence=sequence, segment=index, commanded_azel=(az, el))
                 final_sent = age >= elapsed
-                sleep(max(0, settings.period - (monotonic() - now)))
+                (cancel.wait if cancel is not None else sleep)(max(0, settings.period - (monotonic() - now)))
     finally:
         control.settings = settings
 

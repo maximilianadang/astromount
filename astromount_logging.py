@@ -9,10 +9,11 @@ from astromount_config import ROOT
 
 
 @contextmanager
-def sweep_log(metadata):
-    directory = ROOT / 'output'
-    directory.mkdir(exist_ok=True)
-    path = directory / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-sweep.jsonl')
+def sweep_log(metadata, path=None):
+    if path is None:
+        directory = ROOT / 'output'
+        directory.mkdir(exist_ok=True)
+        path = directory / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-sweep.jsonl')
     with path.open('x') as file:
         def emit(event, **values):
             print(json.dumps(dict(event=event, monotonic_s=monotonic(), unix_s=time(), **values),
