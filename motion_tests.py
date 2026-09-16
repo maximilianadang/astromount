@@ -1,7 +1,7 @@
-"""Supervised mount experiments. All subcommands except --help command motion."""
+"""Supervised hardware motion tests. All subcommands except --help command motion."""
 import argparse
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import math
 from pathlib import Path
@@ -9,7 +9,7 @@ from threading import Event, Timer
 from time import monotonic, sleep
 
 from astromount import Mount
-from astromount_config import PORT, BASELINE, POLARITY, FRAME, ROOT
+from astromount_config import PORT, BASELINE, POLARITY, FRAME
 from astromount_control import Controller, ControlError, Reference, Settings, State, Worker, require_status
 from astromount_trajectory import trace
 
@@ -21,7 +21,7 @@ class Recorder(Controller):
     """Shared preflight/telemetry; raw experiments bypass the position controller."""
     def __init__(self, *args, raw=False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.raw, self.rows, self.origin, self.limits = raw, [], None, (math.inf, math.inf)
+        self.raw, self.rows, self.origin = raw, [], None
         self.started = monotonic()
 
     def read(self):
@@ -32,16 +32,12 @@ class Recorder(Controller):
             state = State(*self.reference.offsets(h, d, old.angles if old else (0, 0)), start, monotonic(), status)
             require_status(status)
             if state.finished_at-start > .25: raise ControlError('Stale position')
-            if any(abs(q) >= self.settings.excursion-self.settings.margin for q in state.angles):
-                raise ControlError('Outside commissioning envelope')
             if old and any(abs(a-b) > .15*(state.finished_at-old.finished_at+.25)+.02
                            for a,b in zip(state.angles, old.angles)):
                 raise ControlError('Overspeed/discontinuity guard')
             self._previous = state
         else:
             state = super().read()
-        if self.origin and any(abs(a-b) >= limit for a,b,limit in zip(state.angles, self.origin, self.limits)):
-            raise ControlError('Outside small-test envelope')
         row = dict(asdict(state), angles=state.angles, estimated_azel=state.pointing(FRAME),
                    elapsed=state.finished_at-self.started)
         if not self.rows or int(row['elapsed']/10) != int(self.rows[-1]['elapsed']/10): emit({'progress': row})
@@ -91,7 +87,6 @@ def timed_motion(control, seconds):
 def raw_trial(c, first, second=None, *, speed=.05, live=False, repeat=False, updates=False):
     """One phase engine for single-axis jogs and both simultaneous-rate experiments."""
     axis = 0 if first in ('east', 'west') else 1
-    c.limits = (.6, .6) if second else tuple((.4 if live else .15) if i == axis else .02 for i in range(2))
     rates, phases = (speed, .1, .025), 3 if live or second else 1
     with timed_motion(c, 6 if second else 5 if live else 2) as expired:
         for phase in range(phases):
@@ -124,13 +119,12 @@ def raw_trial(c, first, second=None, *, speed=.05, live=False, repeat=False, upd
 
 def position_trial(c, args, data):
     origin = tuple(data.get('origin', c.origin))
-    envelope = .15 if args.degrees == .1 else 1.25
     if args.stage == 'back' and any(abs(a-b) > .02 for a,b in zip(c.origin, data['out']['final']['angles'])):
         raise ControlError('Mount changed since outward test')
-    c.origin, c.limits = origin, (.02, envelope)
+    c.origin = origin
     target = (origin[0], origin[1]+(args.degrees if args.stage == 'out' else 0))
     data.update(origin=origin, degrees=args.degrees, reference=c.reference.angles,
-                settings=asdict(c.settings), local_envelope_degrees=envelope)
+                settings=asdict(c.settings))
     result = data[args.stage] = {'target': target, 'samples': c.rows, 'success': False}
     try:
         c.run(ra_degrees=target[0], dec_degrees=target[1])
@@ -144,7 +138,7 @@ def position_trial(c, args, data):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', default=PORT)
-    parser.add_argument('--baseline', type=Path, help='Override baseline; historical tests default to September 8, spiral to active config')
+    parser.add_argument('--baseline', type=Path, default=BASELINE, help='Override the baseline selected in config.json')
     commands = parser.add_subparsers(dest='command', required=True)
     jog = commands.add_parser('jog', help='Bounded single-axis jog or live-rate test')
     jog.add_argument('direction', choices=('east', 'west', 'north', 'south'))
@@ -154,7 +148,7 @@ def main(argv=None):
     both = commands.add_parser('simultaneous', help='Unequal concurrent rates and axis-local stopping')
     both.add_argument('--rate-updates', action='store_true')
     commands.add_parser('pointing', help='Combined +1/+1 az/el at .1 deg/s; no automatic return')
-    commands.add_parser('spiral', help='Logged production spiral: 5 degrees, 120 seconds, 1 deg/s cap')
+    commands.add_parser('spiral', help='Logged production spiral: 5 degrees, 120 seconds, configured speed cap')
     position = commands.add_parser('position', help='Separate out/back joint-position commissioning runs')
     position.add_argument('stage', choices=('out', 'back'))
     position.add_argument('--degrees', type=float, choices=(.1, 1.), default=.1)
@@ -162,15 +156,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     c, record, data = None, None, {}
     try:
-        baseline = args.baseline or (BASELINE if args.command == 'spiral' else ROOT/'baseline-2026-09-08T212838Z.json')
+        baseline = args.baseline
         reference = Reference.from_baseline(baseline)
         directions = json.loads(POLARITY.read_text())['positive_directions']
-        settings = Settings(max_speed=1, margin=1.25, timeout=180) if args.command == 'spiral' else Settings()
-        if args.command == 'pointing': settings = Settings(max_speed=.1, excursion=2, timeout=30)
-        if args.command in ('jog', 'simultaneous'):
-            settings = Settings(excursion=22.25 if args.command == 'jog' else 21.25)
+        settings = Settings()
+        if args.command == 'spiral': settings = replace(settings, timeout=120 + 2*settings.timeout)
+        if args.command == 'pointing':
+            settings = replace(settings, max_speed=min(.1, settings.max_speed))
+        if args.command in ('jog', 'simultaneous') and settings.speed_limit < .15:
+            raise ValueError('Raw motion tests require a speed_limit of at least .15 deg/s')
         if args.command == 'position':
-            settings = Settings(max_speed=3, margin=1.25, timeout=10 if args.degrees == .1 else 15)
+            settings = replace(settings, max_speed=settings.speed_limit)
             path = args.record or Path('position-test-2026-09-08.json' if args.degrees == .1 else 'position-test-1deg-2026-09-08.json')
             if args.stage == 'back':
                 data = json.loads(path.read_text())

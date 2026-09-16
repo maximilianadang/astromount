@@ -1,9 +1,20 @@
-"""Local installation defaults. Importing this module performs no hardware I/O."""
+"""Shared config.json defaults; relative paths are rooted here. No hardware I/O."""
+import json
 from pathlib import Path
 from astromount_kinematics import Pointing
 
 ROOT = Path(__file__).resolve().parent
-PORT = '/dev/serial/by-id/usb-ZWO_Systems_ZWO_Device_123456-if00'
-BASELINE = ROOT / 'baseline-2026-09-11-1032.json'
-POLARITY = ROOT / 'polarity-2026-09-08.json'
-FRAME = Pointing(pitch_sign=1, yaw_sign=-1)
+_config = json.loads((ROOT / 'config.json').read_text())
+if any(not isinstance(_config[key], str) or not _config[key].strip() for key in ('port', 'baseline', 'polarity')):
+    raise ValueError('Config port, baseline, and polarity must be nonempty strings')
+PORT = _config['port']
+BASELINE = ROOT / _config['baseline']
+POLARITY = ROOT / _config['polarity']
+FRAME = Pointing(pitch_sign=_config['pitch_sign'], yaw_sign=_config['yaw_sign'])
+
+MOTION_SETTINGS = ROOT / 'motion-settings.json'
+
+
+def motion_defaults():
+    """Shared motion policy; missing files/keys fail rather than use hidden defaults."""
+    return json.loads(MOTION_SETTINGS.read_text())['motion']

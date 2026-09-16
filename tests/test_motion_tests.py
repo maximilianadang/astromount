@@ -6,12 +6,15 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-import commission
+import motion_tests
 from test_control import Clock, Plant
 
 
 class CommissionTests(TestCase):
     def setUp(self):
+        reference = patch('motion_tests.Reference.from_baseline', return_value=motion_tests.Reference(-90,90))
+        self.reference = reference.start()
+        self.addCleanup(reference.stop)
         self.clock, self.plant = Clock(), None
         self.plant = Plant(self.clock)
         self.plant.identity = lambda: {'model': 'AM5N', 'firmware': 'simulated'}
@@ -21,21 +24,21 @@ class CommissionTests(TestCase):
             original(direction, **kwargs)
             if direction in ('north', 'south'): self.plant.velocity[1] *= -1
         self.plant.jog = jog
-        for module in ('commission', 'astromount_control'):
+        for module in ('motion_tests', 'astromount_control'):
             for name, replacement in (('monotonic', lambda: self.clock.now), ('sleep', self.clock.sleep)):
                 p = patch(f'{module}.{name}', replacement)
                 p.start(); self.addCleanup(p.stop)
-        self.timer_patch = patch('commission.Timer')
+        self.timer_patch = patch('motion_tests.Timer')
         self.timer = self.timer_patch.start()
         self.addCleanup(self.timer_patch.stop)
-        self.mount_patch = patch('commission.Mount')
+        self.mount_patch = patch('motion_tests.Mount')
         self.mount = self.mount_patch.start()
         self.addCleanup(self.mount_patch.stop)
         self.mount.return_value.__enter__.return_value = self.plant
 
     def run_cli(self, args):
         with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-            return commission.main(args)
+            return motion_tests.main(args)
 
     def test_help_and_invalid_commands_do_not_open_device(self):
         for args in (['--help'], ['jog','--help'], ['simultaneous','--help'], ['pointing','--help'],
@@ -45,6 +48,7 @@ class CommissionTests(TestCase):
 
     def test_single_jog_stops_and_preserves_other_axis(self):
         self.assertEqual(self.run_cli(['jog','west']), 0)
+        self.reference.assert_called_once_with(motion_tests.BASELINE)
         self.assertGreater(self.plant.q[0], .08)
         self.assertLessEqual(self.plant.q[0], .15)
         self.assertEqual(self.plant.q[1], 0)
@@ -53,6 +57,10 @@ class CommissionTests(TestCase):
         self.assertEqual(self.timer.call_args.args[0], 2)
         self.timer.return_value.cancel.assert_called_once()
         self.timer.return_value.join.assert_called_once()
+
+    def test_explicit_baseline_overrides_config(self):
+        self.assertEqual(self.run_cli(['--baseline', 'custom.json', 'jog', 'west']), 0)
+        self.reference.assert_called_once_with(Path('custom.json'))
 
     def test_live_rate_updates_have_no_intermediate_stop(self):
         self.plant._command = Mock()
@@ -78,16 +86,16 @@ class CommissionTests(TestCase):
 
     def test_pointing_uses_production_controller_and_converges(self):
         self.assertEqual(self.run_cli(['pointing']), 0)
-        azel = commission.FRAME.forward(*self.plant.q)
+        azel = motion_tests.FRAME.forward(*self.plant.q)
         for value in azel: self.assertAlmostEqual(value, 1, delta=.02)
         self.assertFalse(any(self.plant.velocity))
 
     def test_spiral_uses_worker_and_active_baseline(self):
-        with patch('commission.Worker') as worker, patch('commission.trace') as trace, \
-             patch('commission.Reference.from_baseline', return_value=commission.Reference(-90,90)) as load:
+        with patch('motion_tests.Worker') as worker, patch('motion_tests.trace') as trace, \
+             patch('motion_tests.Reference.from_baseline', return_value=motion_tests.Reference(-90,90)) as load:
             self.assertEqual(self.run_cli(['spiral']), 0)
-            load.assert_called_once_with(commission.BASELINE)
-            trace.assert_called_once_with(worker.return_value.__enter__.return_value, commission.FRAME)
+            load.assert_called_once_with(motion_tests.BASELINE)
+            trace.assert_called_once_with(worker.return_value.__enter__.return_value, motion_tests.FRAME)
             worker.return_value.__exit__.assert_called_once()
 
     def test_out_back_records_preserved_and_replays_rejected(self):

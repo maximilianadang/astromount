@@ -1,4 +1,4 @@
-"""Bounded joint-space P control. Importing/constructing objects performs no I/O."""
+"""Bounded joint-space P control. Reads shared settings; no hardware I/O on import."""
 
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -9,6 +9,9 @@ from threading import Event, Lock, Thread
 from time import monotonic, sleep
 
 from astromount import Mount, decode_coordinates
+from astromount_config import motion_defaults
+
+_defaults = motion_defaults()
 
 
 class ControlError(RuntimeError):
@@ -66,30 +69,34 @@ class Reference:
 
 @dataclass(frozen=True)
 class Settings:
-    kp: float = 0.5                 # (deg/s) per degree of error
-    max_speed: float = 0.1          # deg/s, common cap for either axis
-    deadband: float = 0.01          # degrees
-    excursion: float = 22.5         # degrees from Reference on each axis
-    margin: float = 0.25            # stop inside excursion boundary
-    period: float = 0.1             # seconds; requested sampling period
-    max_sample_age: float = 0.25    # seconds, including complete read transaction
-    timeout: float = 300            # seconds per target
-    progress_timeout: float = 5     # seconds without measurable commanded motion
-    settle_samples: int = 3
+    kp: float = _defaults['kp']
+    max_speed: float = _defaults['max_speed']
+    speed_limit: float = _defaults['speed_limit']
+    deadband: float = _defaults['deadband']
+    period: float = _defaults['period']
+    max_sample_age: float = _defaults['max_sample_age']
+    timeout: float = _defaults['timeout']
+    progress_timeout: float = _defaults['progress_timeout']
+    settle_samples: int = _defaults['settle_samples']
 
     def __post_init__(self):
-        values = (self.kp, self.max_speed, self.deadband, self.excursion,
-                  self.margin, self.period, self.max_sample_age, self.timeout, self.progress_timeout)
+        values = (self.kp, self.max_speed, self.speed_limit, self.deadband,
+                  self.period, self.max_sample_age, self.timeout, self.progress_timeout)
         if not all(math.isfinite(v) and v > 0 for v in values):
             raise ValueError("Controller settings must be finite and positive")
-        if not self.deadband < self.margin < self.excursion < 90 or self.max_speed > 6:
-            raise ValueError("Require deadband < margin < excursion < 90 and max_speed <= 6")
+        if not self.max_speed <= self.speed_limit <= 3:
+            raise ValueError("Require max_speed <= speed_limit <= 3")
         if self.kp * self.deadband < 0.01 * (360 / 86164.0905):
             raise ValueError("Gain/deadband demand speeds below firmware resolution")
-        if self.margin <= self.max_speed * (self.period + self.max_sample_age) + self.deadband:
-            raise ValueError("Margin must exceed nominal sampling travel plus deadband")
         if type(self.settle_samples) is not int or self.settle_samples < 1:
             raise ValueError("settle_samples must be a positive integer")
+
+    def validate_target(self, ra_degrees, dec_degrees):
+        """Validate finite joint offsets; no software excursion boundary or I/O."""
+        target = (ra_degrees, dec_degrees)
+        if not all(math.isfinite(v) for v in target):
+            raise ValueError("Target joint offsets must be finite")
+        return target
 
 
 @dataclass(frozen=True)
@@ -114,7 +121,7 @@ def duration_settings(settings, current, target, duration):
     if not math.isfinite(duration) or duration <= 0: raise ValueError('Duration must be finite and positive')
     require_status(current.status, stationary=True)
     distance = max(abs(a-b) for a, b in zip(target, current.angles))
-    speed = min(3, distance / duration) if distance > settings.deadband else settings.max_speed
+    speed = min(settings.speed_limit, distance / duration) if distance > settings.deadband else settings.max_speed
     if speed < .01 * (360 / 86164.0905): raise ValueError('Duration demands a speed below firmware resolution')
     return replace(settings, max_speed=speed, timeout=duration + settings.timeout)
 
@@ -149,8 +156,6 @@ class Controller:
         require_status(status)
         old = self._previous
         angles = self.reference.offsets(h, d, old.angles if old else (0, 0))
-        if any(abs(v) >= s.excursion - s.margin for v in angles):
-            raise ControlError("Position reached the excursion stopping boundary")
         if old:
             # Reject discontinuities, wrong-axis motion and gross overspeed.
             allowance = s.max_speed * (end - old.started_at) * 1.1 + s.deadband
@@ -217,12 +222,6 @@ class Controller:
         finally:
             self._action, self._progress = [0.0, 0.0], [None, None]
 
-    def _target(self, ra_degrees, dec_degrees):
-        target, s = (ra_degrees, dec_degrees), self.settings
-        if not all(math.isfinite(v) and abs(v) < s.excursion - s.margin - s.deadband for v in target):
-            raise ValueError("Target must be inside excursion minus margin and deadband")
-        return target
-
     def _step(self, target, state, permit=lambda: True):
         s = self.settings
         def fresh_permit():
@@ -244,7 +243,7 @@ class Controller:
         cancel is an optional threading.Event; on_sample receives State each tick.
         Callbacks must not block. Timeout/cancellation/errors attempt stop and raise.
         """
-        target, s = self._target(ra_degrees, dec_degrees), self.settings
+        target, s = self.settings.validate_target(ra_degrees, dec_degrees), self.settings
         with self.mount._lock:
             self._previous = None
             self._action, self._progress = [0.0, 0.0], [None, None]
@@ -311,7 +310,7 @@ class Worker:
     Caller owns Mount lifetime and must not access Mount/Controller until close.
     """
 
-    def __init__(self, controller: Controller, *, heartbeat: float = 0.5):
+    def __init__(self, controller: Controller, *, heartbeat: float = _defaults['heartbeat']):
         if not math.isfinite(heartbeat) or heartbeat <= 0:
             raise ValueError("heartbeat must be finite and positive")
         self.controller, self.heartbeat = controller, heartbeat
@@ -339,7 +338,7 @@ class Worker:
             return self._snapshot
 
     def _publish(self, ra_degrees, dec_degrees, issued_at, arm):
-        angles = self.controller._target(ra_degrees, dec_degrees)
+        angles = self.controller.settings.validate_target(ra_degrees, dec_degrees)
         with self._lock:
             now, current = monotonic(), self._snapshot
             stamp = now if issued_at is None else issued_at

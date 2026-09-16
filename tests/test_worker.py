@@ -126,7 +126,7 @@ class WorkerTests(unittest.TestCase):
     def test_invalid_and_out_of_order_targets_do_not_refresh(self):
         stamp = monotonic()
         self.worker.arm(ra_degrees=0, dec_degrees=1, issued_at=stamp)
-        for value in (float('nan'), 30):
+        for value in (float('nan'), float('inf')):
             with self.assertRaises(ValueError):
                 self.worker.set_target(ra_degrees=0, dec_degrees=value)
         for when in (stamp, stamp-1, monotonic()+1):

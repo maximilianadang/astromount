@@ -10,4 +10,4 @@ requires-python = ">=3.10"
 dependencies = ["pyserial>=3.5,<4"]
 
 [tool.setuptools]
-py-modules = ["astromount", "astromount_control", "astromount_kinematics", "astromount_trajectory", "astromount_config"]
+py-modules = ["astromount", "astromount_control", "astromount_kinematics", "astromount_trajectory", "astromount_config", "astromount_logging"]

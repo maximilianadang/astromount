@@ -1,0 +1,7 @@
+{
+  "port": "/dev/serial/by-id/usb-ZWO_Systems_ZWO_Device_123456-if00",
+  "baseline": "baseline-2026-09-11-1032.json",
+  "polarity": "polarity-2026-09-08.json",
+  "pitch_sign": 1,
+  "yaw_sign": -1
+}

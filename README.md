@@ -37,11 +37,22 @@ not absolute encoder measurements or simultaneous joint-angle samples.
 
 ### Command-line pointing
 
-Local defaults live in `astromount_config.py`: `PORT`, `BASELINE`, `POLARITY`,
-and `FRAME`. The active baseline is `baseline-2026-09-11-1032.json`; CLI overrides
-remain available. Change the shared config rather than editing individual tools.
-Historical experiments in `commission.py` retain their explicitly pinned September 8
-baseline/test envelopes; they are not replacements for the current `point.py` CLI.
+Edit `config.json` for installation defaults: `port`, `baseline`, `polarity`,
+`pitch_sign`, and `yaw_sign`. `astromount_config.py` is only their shared loader;
+relative file paths resolve against the config directory, not the working directory.
+All tools use these defaults where relevant, including every `motion_tests.py`
+subcommand. Explicit CLI overrides take precedence. `zero_mount.py` uses the port
+but creates a baseline rather than reading one, and does not update the config.
+Changes take effect on the next script run; missing/invalid settings fail rather
+than silently falling back to historical defaults.
+Controller settings have one shared source: this repository's `motion-settings.json`,
+under `motion`. Point, sequence, Python controller/worker, hardware tests, and LiDAR
+motion all use its gain, speed, deadband, sampling/timeout,
+settling, and heartbeat defaults. Explicit CLI overrides take precedence.
+`max_speed` is the default rate for untimed moves; `speed_limit` caps duration-based
+moves and explicit speeds, and cannot exceed the tested 3°/s ceiling.
+Hardware test procedures retain explicit reduced rates/envelopes and watchdogs;
+these do not replace the shared operational defaults.
 Live reads and saved references share one coordinate decoder and clock-bracket
 validation. Baseline capture uses the same raw coordinate sampling method.
 
@@ -78,7 +89,8 @@ the observed signs `pitch_sign=+1`, `yaw_sign=-1`, converts the target with IK,
 and calls `control.run_pointing(frame, azimuth=..., elevation=...)`. Both joints
 are driven concurrently whenever both have position error. No planner heartbeat is
 required for a blocking single target. Default speed cap is 1°/s (maximum 3); timeout is
-30 seconds. The 1.25° stopping margin and existing controller checks remain enabled.
+30 seconds. There is no software excursion limit or stopping margin; supervise
+motion visually with an accessible E-stop. Speed, feedback and timeout checks remain.
 
 `--delta` adds the supplied az/el to the current measured root-frame az/el, not
 to joint angles. For point moves, `--duration SECONDS` replaces `--speed`: the
@@ -108,6 +120,14 @@ per waypoint. `--timeout` applies per waypoint in addition to its duration.
 `sequence.py --path waypoints.csv --dry-run` validates without opening the device;
 live-dependent speed feasibility is checked before each move.
 
+Add `--delta` to interpret every row as an az/el displacement from the measured
+position at the start of that row (after the previous move settles). The CSV is
+checked for finite values and positive durations upfront; each resulting absolute
+target is checked against IK and safety limits before its move. Like `point.py`,
+delta mode cannot use `--dry-run` because targets depend on live measurements.
+Opposite deltas approximately retrace motion; use an absolute waypoint to return
+to a fixed saved target without accumulating waypoint settling errors.
+
 Baseline and polarity paths default relative to the script, not the shell directory.
 Override with `--baseline`, `--polarity`, and `--port`. Completion prints joint
 offsets, model-estimated az/el, and status; errors return a nonzero exit code.
@@ -115,40 +135,89 @@ Keep the E-stop available. The single-axis signs were observed physically;
 the adapted controller reached one combined (+1°, +1°) target at .1°/s on hardware.
 That verifies firmware-feedback convergence, not independent optical accuracy.
 
-### Commissioning CLI
+### Continuous CSV sweeps
 
-`commission.py` replaces the five standalone commissioning/probe scripts. It shares
+`sweep.py` is a separate experimental alternative; `sequence.py` is unchanged.
+Every non-dry-run sweep that opens the mount writes
+`output/YYYYMMDDTHHMMSSffffffZ-sweep.jsonl` relative to the astromount repository.
+The terminal prints its path. Each run uses a new file; rows are flushed as written.
+Records include resolved input waypoints, baseline reference, frame signs, polarity,
+settings, initial pointing, resolved timed segments, published az/el targets, and
+worker feedback snapshots (measured az/el, joint coordinates, query timestamps,
+latest/applied targets, lifecycle and fault). The final event records completion,
+interruption, or failure after worker cleanup. A crash/power loss may leave a
+partial file without a final event; flushing is not a power-loss durability guarantee.
+
+Telemetry uses monotonic timestamps for alignment and Unix timestamps for wall
+time. Snapshots are sampled by the planner at its configured period, not extra
+hardware polls; repeated measurement timestamps denote the same measurement and
+intermediate worker samples may be skipped. Compare the saved plan at the query
+midpoint to measured pointing to estimate trajectory error; do not subtract a
+newly published target from older feedback. Applied targets mark worker dispatch,
+not firmware acknowledgements. This measures model feedback, not optical truth.
+
+It accepts the same CSV (`az,el,duration`) and CLI options:
+
+```bash
+.venv/bin/python sweep.py --path waypoints.csv --dry-run
+.venv/bin/python sweep.py --path waypoints.csv
+.venv/bin/python sweep.py --path waypoints.csv --delta
+```
+
+It starts from the measured pointing and linearly interpolates root-frame az/el
+over each row's duration, publishing at the configured `period` through the
+existing worker/heartbeat. There is no intermediate arrival wait or command queue;
+late ticks skip ahead in time. It holds the final target until settled, or faults
+after the final `timeout`. One final JSON measurement is printed. Worker exit
+attempts to stop on success, fault, or Ctrl-C.
+
+Equal endpoint elevations give a constant-elevation commanded segment; if the
+initial measured elevation differs, the first segment interpolates to it.
+For continuous `--delta`, rows accumulate from the initial measured pointing and
+previous **planned** endpoint, not from each lagging measured position. Zero
+elevation deltas therefore keep the original commanded elevation. This deliberately
+differs from stop-and-settle `sequence.py` delta semantics.
+
+Durations schedule moving targets, not guaranteed physical arrival times. Joint
+commands remain capped by `speed_limit`; the unchanged proportional controller
+can lag, miss intermediate waypoints, and deviate in elevation. No feedforward or
+constant-elevation tracking guarantee is added. Absolute dry-run validates CSV/IK
+without opening hardware; actual-start validation happens before arming. Delta
+dry-run remains unavailable. No automated hardware validation has been performed.
+
+### Hardware motion tests
+
+`motion_tests.py` replaces the five standalone commissioning/probe scripts. It shares
 connection setup, preflight, telemetry, stationary verification, and raw-test timers.
 `point.py`, `zero_mount.py`, and `measure.py` remain the everyday interfaces.
 
 | Previous script | New command |
 | --- | --- |
-| `calibrate_jog.py west` | `commission.py jog west` |
-| `calibrate_jog.py south --live-rate-test --repeat-direction` | `commission.py jog south --live-rate-test --repeat-direction` |
-| `probe_simultaneous.py` | `commission.py simultaneous` |
-| `probe_simultaneous.py --rate-updates` | `commission.py simultaneous --rate-updates` |
-| `probe_pointing.py` | `commission.py pointing` |
-| `probe_spiral.py` | `commission.py spiral` |
-| `test_position_live.py out` / `back` | `commission.py position out` / `back` |
+| `calibrate_jog.py west` | `motion_tests.py jog west` |
+| `calibrate_jog.py south --live-rate-test --repeat-direction` | `motion_tests.py jog south --live-rate-test --repeat-direction` |
+| `probe_simultaneous.py` | `motion_tests.py simultaneous` |
+| `probe_simultaneous.py --rate-updates` | `motion_tests.py simultaneous --rate-updates` |
+| `probe_pointing.py` | `motion_tests.py pointing` |
+| `probe_spiral.py` | `motion_tests.py spiral` |
+| `test_position_live.py out` / `back` | `motion_tests.py position out` / `back` |
 
 All experiments command physical motion. `--help` is offline. Global options go
 **before** the subcommand. To deliberately use the new physical baseline:
 
 ```bash
-.venv/bin/python commission.py --help
-.venv/bin/python commission.py --baseline baseline-2026-09-11-1032.json pointing
-.venv/bin/python commission.py --baseline baseline-2026-09-11-1032.json position out --record trial.json
-.venv/bin/python commission.py --baseline baseline-2026-09-11-1032.json position back --record trial.json
+.venv/bin/python motion_tests.py --help
+.venv/bin/python motion_tests.py --baseline baseline-2026-09-11-1032.json pointing
+.venv/bin/python motion_tests.py --baseline baseline-2026-09-11-1032.json position out --record trial.json
+.venv/bin/python motion_tests.py --baseline baseline-2026-09-11-1032.json position back --record trial.json
 ```
 
-Non-spiral experiments default to the historical September 8 baseline for
-reproducibility; `spiral` uses the active configured baseline. Choose explicitly
-when commissioning the current physical setup. Position tests retain `.1`/`1`
+All experiments default to the baseline in `config.json`; use `--baseline` to
+select a historical reference explicitly. Position tests retain `.1`/`1`
 degree choices and separate out/back invocations. Existing outward records cannot
 be overwritten; returns require a successful out, unchanged endpoint, and matching
 degrees/reference when recorded. Logs now share one JSON telemetry format; saved
 historical logs are unchanged. Raw tests retain short watchdogs, bounded rates,
-local excursion checks and global stop cleanup; all modes verify stationary exit.
+global stop cleanup; all modes verify stationary exit. Local excursion guards are removed.
 The raw jog additionally uses the shared overspeed check. No experiment was run
 on hardware during this consolidation. The spiral fix still needs physical validation.
 
@@ -180,7 +249,7 @@ may lag; this is not a guarantee of a smooth path or a hard measured cone bound.
 Individual-axis directions have been observed; combined trajectory tracking has
 not yet been validated on hardware. Keep the E-stop ready. The saved baseline
 must still be valid, and the approach from the current pose must be unobstructed.
-Existing excursion, freshness, progress and stop checks remain unchanged; the
+Existing freshness, progress and stop checks remain unchanged; the
 continuous-motion timeout covers the requested duration plus two arrival timeouts.
 
 These calls **physically move the mount or change tracking**; they are examples,
@@ -224,9 +293,9 @@ RA/DEC or encoder readings. `run_pointing` and the worker's pointing methods use
 the configured FRD kinematics to convert root az/el to these joint targets;
 `state.pointing(frame)` maps measured joints back through FK.
 
-- Defaults: gain 0.5/s, speed cap 0.1°/s, requested sampling 10 Hz, deadband 0.01°.
-- Excursion: ±22.5° per joint; stop boundary is ±22.25° with the default margin.
-  Targets must be strictly inside ±22.24° to reserve deadband clearance.
+- Shared defaults: gain 0.5/s, speed cap 1°/s, requested sampling 10 Hz, deadband 0.01°.
+- No software excursion boundary or stopping margin. Finite joint targets are
+  accepted; az/el IK still selects only the front-facing, nonsingular branch.
 - Reads combined firmware equatorial coordinates bracketed by sidereal time;
   reconstructs the nearest continuous mechanical branch relative to the baseline.
 - Computes a capped P velocity for each joint on every tick. Stops/restarts only
@@ -240,7 +309,7 @@ the configured FRD kinematics to convert root az/el to these joint targets;
   not erase interval history; rejected samples do not advance it. This is a
   conservative speed-cap bound, not a feedforward prediction of exact travel.
   Progress checks are per axis: one moving joint cannot conceal a stalled partner.
-- Returns after three stationary samples inside deadband. Timeout (300 s),
+- Returns after three stationary samples inside deadband. Timeout (30 s),
   cancellation, exceptions, and Ctrl-C attempt a stop, reconnecting if needed.
 
 Concurrent unequal low rates and axis-local rate changes were measured on AM5N
@@ -317,7 +386,7 @@ and the telescope-to-plate transform are deliberately excluded.
 from astromount_kinematics import Pointing
 
 # Explicit NOMINAL sign assumption, not independently verified FRD polarity:
-frame = Pointing(pitch_sign=1, yaw_sign=1, limit=22.5)
+frame = Pointing(pitch_sign=1, yaw_sign=1)
 az, el = frame.forward(lower=-0.0083333333, upper=-12.4244444444)
 lower, upper = frame.inverse(azimuth=5, elevation=5)
 # Inside an already armed worker, publishing this target commands motion:
@@ -333,8 +402,7 @@ independently established; do not treat this example as that calibration.
 The inverse is analytic and unique on the configured local branch (each joint
 limited to less than 90°). Unreachable az/el targets and invalid inputs raise
 `ValueError`; no numerical solver, queued trajectory, or firmware go-to is used.
-The controller's existing stopping margin is stricter than the geometric limit
-and still applies when accepting the resulting joint targets.
+The former ±22.5° geometric cap and controller stopping margin are removed.
 
 Nominal (+1,+1) mapping of the saved manual captures, in degrees:
 
@@ -345,7 +413,7 @@ Nominal (+1,+1) mapping of the saved manual captures, in degrees:
 | Second manual capture | -0.008333 | -12.424444 | -12.424445 | -0.008138 |
 
 These are model predictions for captured endpoints, not measured root-frame
-angles or established mechanical travel limits. For the configured ±22.5° joint
+angles or established mechanical travel limits. For the historically tested ±22.5° joint
 box, lower-only endpoints are (az 0°, el ±22.5°), upper-only endpoints are
 (az ±22.5°, el 0°), and the four corners are (az ±24.148675°, el ±20.704811°).
 The boundary is curved, not a rectangular az/el box or an exact circular cone.
@@ -382,8 +450,8 @@ with Worker(control, heartbeat=0.5) as worker:
 ```
 
 This example commands physical motion when armed. All targets remain absolute
-degree offsets from the unchanged saved reference. Use `Settings(max_speed=3,
-margin=1.25)` on the underlying controller for the previously tested single-axis cap; other defaults are
+degree offsets from the unchanged saved reference. Use `Settings(max_speed=3)`
+on the underlying controller for the previously tested single-axis cap; other defaults are
 unchanged. `run()` remains available for blocking, single-target applications;
 do not call it or access the Mount/Controller while its Worker is running.
 

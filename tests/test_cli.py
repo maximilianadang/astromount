@@ -4,12 +4,50 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import point
-from astromount_control import State
+from astromount_control import State, Settings
 from astromount_config import BASELINE, PORT, FRAME
 from pathlib import Path
 
 
 class CLITests(TestCase):
+    def test_custom_motion_limits_apply_before_opening_port(self):
+        with patch('point.Mount') as mount, redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(point.main(['45', '0', '--deadband', '.02', '--dry-run']), 0)
+            for options in (['--excursion', '6', '--margin', '2'], ['--deadband', '0'], ['--margin', '.1']):
+                with self.subTest(options=options), self.assertRaises(SystemExit):
+                    point.main(['5', '0', *options, '--dry-run'])
+            mount.assert_not_called()
+
+    def test_settings_validate_without_controller(self):
+        settings = Settings()
+        self.assertEqual(settings.validate_target(1, -2), (1, -2))
+        self.assertEqual(settings.validate_target(100, -100), (100, -100))
+        for value in (float('nan'), float('inf')):
+            for target in ((value, 0), (0, value)):
+                with self.subTest(target=target), self.assertRaises(ValueError):
+                    settings.validate_target(*target)
+
+    def test_dry_run_constructs_no_controller(self):
+        with patch('point.Controller') as controller, patch('point.Mount') as mount, redirect_stdout(StringIO()):
+            self.assertEqual(point.main(['0', '0', '--dry-run']), 0)
+            controller.assert_not_called()
+            mount.assert_not_called()
+
+    def test_spiral_dispatch_does_not_run_point_move(self):
+        with patch('point.Mount'), patch('point.Controller') as factory, patch('point.Worker') as worker, \
+             patch('point.trace', return_value=State(0,0,0,1,'nNG')) as trace, redirect_stdout(StringIO()):
+            self.assertEqual(point.main(['0','0','--spiral','5','--speed','1','--duration','20']), 0)
+            trace.assert_called_once_with(worker.return_value.__enter__.return_value, FRAME,
+                                          duration=20, radius=5, turns=2, settle_timeout=30)
+            factory.return_value.read.assert_not_called()
+            factory.return_value.run_pointing.assert_not_called()
+            self.assertEqual(factory.call_args.kwargs['settings'].timeout, 80)
+
+    def test_absolute_point_dry_run_has_no_excursion_boundary(self):
+        with patch('point.Mount') as mount, redirect_stdout(StringIO()):
+            self.assertEqual(point.main(['45','30','--dry-run']), 0)
+            mount.assert_not_called()
+
     def test_shared_defaults_and_explicit_baseline_override(self):
         with patch('point.Mount') as mount, patch('point.Reference.from_baseline') as load, redirect_stdout(StringIO()):
             point.main(['0', '0', '--dry-run'])
@@ -47,6 +85,8 @@ class CLITests(TestCase):
             self.assertEqual((call.args[0].pitch_sign, call.args[0].yaw_sign), (1, -1))
             self.assertEqual(controller.call_args.kwargs['settings'].max_speed, 1)
             self.assertEqual(controller.call_args.kwargs['positive_directions'], ['west','south'])
+            controller.assert_called_once()
+            self.assertIs(controller.call_args.args[0], mount.return_value.__enter__.return_value)
             mount.return_value.__exit__.assert_called_once()
 
     def test_failure_returns_nonzero(self):
@@ -89,7 +129,7 @@ class CLITests(TestCase):
             mount.assert_not_called()
 
     def test_bad_live_target_or_state_never_runs(self):
-        for current, args in [(State(0,-20,0,1,'nNG'), ['5','0','--delta']),
+        for current, args in [(State(0,-85,0,1,'nNG'), ['10','0','--delta']),
                               (State(0,0,0,1,'nG'), ['5','0','--delta']),
                               (State(0,0,0,1,'nNG'), ['5','0','--duration','1000000'])]:
             with self.subTest(args=args, current=current), patch('point.Mount'), patch('point.Controller') as factory, redirect_stderr(StringIO()):

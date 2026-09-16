@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 from contextlib import redirect_stdout
 from io import StringIO
 import runpy
@@ -10,6 +11,17 @@ from astromount_control import Reference
 
 
 class MeasureTests(TestCase):
+    def test_import_performs_no_io(self):
+        with patch('astromount.Mount') as mount, patch.object(Reference, 'from_baseline') as baseline, \
+             redirect_stdout(StringIO()) as output:
+            spec = importlib.util.spec_from_file_location('measure', ROOT / 'measure.py')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertTrue(callable(module.main))
+            mount.assert_not_called()
+            baseline.assert_not_called()
+            self.assertEqual(output.getvalue(), '')
+
     def test_baseline_azel_uses_only_getters(self):
         with patch('astromount.Mount') as cls, redirect_stdout(StringIO()) as output:
             mount = cls.return_value.__enter__.return_value

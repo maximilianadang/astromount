@@ -1,9 +1,60 @@
-"""Baseline-centered spherical spiral and latest-target planner; no serial I/O."""
+"""Az/el trajectory planners using the existing latest-target worker."""
 
 import math
+from dataclasses import asdict, replace
 from time import monotonic, sleep
 
-from astromount_control import ControlError
+from astromount_control import ControlError, Worker, require_status
+
+
+def sweep(control, frame, waypoints, *, delta=False, log=None):
+    """Stream time-interpolated az/el; cumulative deltas, no waypoint stops.
+
+    Durations schedule targets, not guaranteed arrival. The caller owns Mount;
+    Worker owns serial I/O during streaming and stops on every exit.
+    """
+    settings = control.settings
+    current = control.read()
+    if log: log('initial', state=asdict(current), measured_azel=current.pointing(frame))
+    require_status(current.status, stationary=True)
+    origin = current.pointing(frame)
+    segments, elapsed, start = [], 0., origin
+    for az, el, duration in waypoints:
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError('Duration must be finite and positive')
+        if delta: az, el = start[0] + az, start[1] + el
+        # Normalize equivalent azimuths onto the front-facing IK branch.
+        target = frame.forward(*frame.inverse(az, el))
+        elapsed += duration
+        segments.append((elapsed, start, target, duration))
+        start = target
+    if not segments: raise ValueError('Sweep requires at least one waypoint')
+    control.settings = replace(settings, max_speed=settings.speed_limit, timeout=elapsed + settings.timeout)
+    try:
+        with Worker(control) as worker:
+            worker.arm_pointing(frame, azimuth=origin[0], elevation=origin[1])
+            began, index, final_sent = monotonic(), 0, False
+            if log: log('plan', began_monotonic_s=began, segments=segments, settings=asdict(control.settings), heartbeat=worker.heartbeat)
+            while True:
+                now, snapshot = monotonic(), worker.snapshot
+                if log:
+                    log('feedback', snapshot=asdict(snapshot),
+                        measured_azel=snapshot.state.pointing(frame) if snapshot.state else None)
+                if snapshot.fault or not snapshot.armed:
+                    raise ControlError(snapshot.fault or f'Worker is {snapshot.mode.value}')
+                age = now - began
+                if final_sent and snapshot.arrived: return snapshot.state
+                if age >= elapsed + settings.timeout: raise ControlError('Sweep arrival timed out')
+                while index < len(segments)-1 and age >= segments[index][0]: index += 1
+                end, start, target, duration = segments[index]
+                fraction = min(1., max(0., (age - end + duration) / duration))
+                az, el = (a + fraction*(b-a) for a, b in zip(start, target))
+                sequence = worker.set_pointing(frame, azimuth=az, elevation=el, issued_at=now)
+                if log: log('target', issued_at=now, sequence=sequence, segment=index, commanded_azel=(az, el))
+                final_sent = age >= elapsed
+                sleep(max(0, settings.period - (monotonic() - now)))
+    finally:
+        control.settings = settings
 
 
 def spiral(fraction, radius=5, turns=2):

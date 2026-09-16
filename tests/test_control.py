@@ -86,7 +86,7 @@ class ControlTests(unittest.TestCase):
             self.assertLessEqual(abs(state.dec_degrees-dec), self.controller.settings.deadband)
             self.assertEqual(state.ra_degrees, 0)
         self.assertFalse(any(self.plant.velocity))
-        self.assertTrue(all(c[1] <= 0.1 for c in self.plant.commands if c[0] != 'stop'))
+        self.assertTrue(all(c[1] <= self.controller.settings.max_speed for c in self.plant.commands if c[0] != 'stop'))
 
     def test_two_axis_target(self):
         state = self.controller.run(ra_degrees=1, dec_degrees=-2)
@@ -179,7 +179,7 @@ class ControlTests(unittest.TestCase):
         self.assertAlmostEqual(second[1], -12.4244444444)
 
     def test_invalid_targets_send_nothing(self):
-        for value in (22.5, -22.5, 22.24, float("nan"), float("inf")):
+        for value in (float("nan"), float("inf")):
             with self.assertRaises(ValueError):
                 self.controller.run(ra_degrees=0, dec_degrees=value)
         self.assertEqual(self.plant.commands, [])
@@ -221,10 +221,9 @@ class ControlTests(unittest.TestCase):
             self.controller.run(ra_degrees=0, dec_degrees=5, on_sample=fail)
         self.assertFalse(any(self.plant.velocity))
 
-    def test_excursion_and_discontinuity(self):
-        self.plant.q[1] = 22.3
-        with self.assertRaisesRegex(ControlError, "boundary"):
-            self.controller.run(ra_degrees=0, dec_degrees=0)
+    def test_large_position_allowed_but_discontinuity_rejected(self):
+        self.plant.q[1] = 45
+        self.assertAlmostEqual(self.controller.read().angles[1], 45)
         self.plant.q = [0, 0]
         def jump(state):
             self.plant.q[0] = 2
@@ -234,7 +233,7 @@ class ControlTests(unittest.TestCase):
 
     def test_settings_validation(self):
         self.assertEqual(Settings().deadband, .01)
-        for args in ({"kp": 0}, {"max_speed": 7}, {"max_speed": 1}, {"margin": 23}, {"deadband": 0.5}, {"settle_samples": True}):
+        for args in ({"kp": 0}, {"max_speed": 7}, {"deadband": 0}, {"settle_samples": True}):
             with self.assertRaises(ValueError):
                 Settings(**args)
 
@@ -243,7 +242,7 @@ class ControlTests(unittest.TestCase):
             with self.subTest(axis=axis):
                 plant = Plant(self.clock)
                 c = Controller(plant, Reference(-90, 90), positive_directions=('west', 'north'),
-                               settings=Settings(max_speed=1, margin=1.25))
+                               settings=Settings(max_speed=1))
                 velocity = [0, 0]
                 velocity[axis] = -.7
                 c.read()
@@ -267,7 +266,7 @@ class ControlTests(unittest.TestCase):
             with self.subTest(global_stop=global_stop):
                 plant = Plant(self.clock)
                 c = Controller(plant, Reference(-90, 90), positive_directions=('west', 'north'),
-                               settings=Settings(max_speed=1, margin=1.25))
+                               settings=Settings(max_speed=1))
                 c.read()
                 c._drive((.7, -.7))
                 self.clock.sleep(.04)

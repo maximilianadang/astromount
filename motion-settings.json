@@ -1,0 +1,14 @@
+{
+  "motion": {
+    "deadband": 0.01,
+    "kp": 0.5,
+    "max_speed": 1,
+    "speed_limit": 3,
+    "period": 0.1,
+    "max_sample_age": 0.25,
+    "timeout": 30,
+    "progress_timeout": 5,
+    "settle_samples": 3,
+    "heartbeat": 0.5
+  }
+}
