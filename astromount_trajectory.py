@@ -7,12 +7,16 @@ from time import monotonic, sleep
 from astromount_control import ControlError, Worker, require_status
 
 
-def sweep(control, frame, waypoints, *, delta=False, log=None, cancel=None):
+def sweep(control, frame, waypoints, *, delta=False, log=None, cancel=None, target_at=None):
     """Stream time-interpolated az/el; cumulative deltas, no waypoint stops.
 
     Durations schedule targets, not guaranteed arrival. The caller owns Mount;
     Worker owns serial I/O during streaming and stops on every exit.
+    target_at(elapsed_s, origin) optionally supplies live absolute targets.
+    Its final target is held throughout the usual settling window.
     """
+    if target_at is not None and delta:
+        raise ValueError('Live sweep targets require absolute pointing')
     if cancel is not None and cancel.is_set(): raise InterruptedError('Sweep canceled')
     settings = control.settings
     current = control.read()
@@ -23,9 +27,11 @@ def sweep(control, frame, waypoints, *, delta=False, log=None, cancel=None):
     for az, el, duration in waypoints:
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError('Duration must be finite and positive')
-        if delta: az, el = start[0] + az, start[1] + el
-        # Normalize equivalent azimuths onto the front-facing IK branch.
-        target = frame.forward(*frame.inverse(az, el))
+        target = start
+        if target_at is None:
+            if delta: az, el = start[0] + az, start[1] + el
+            # Normalize equivalent azimuths onto the front-facing IK branch.
+            target = frame.forward(*frame.inverse(az, el))
         elapsed += duration
         segments.append((elapsed, start, target, duration))
         start = target
@@ -35,7 +41,8 @@ def sweep(control, frame, waypoints, *, delta=False, log=None, cancel=None):
         with Worker(control) as worker:
             worker.arm_pointing(frame, azimuth=origin[0], elevation=origin[1])
             began, index, final_sent = monotonic(), 0, False
-            if log: log('plan', began_monotonic_s=began, segments=segments, settings=asdict(control.settings), heartbeat=worker.heartbeat)
+            if log: log('plan', began_monotonic_s=began, segments=segments, settings=asdict(control.settings),
+                        heartbeat=worker.heartbeat, live_targets=target_at is not None)
             while True:
                 if cancel is not None and cancel.is_set(): raise InterruptedError('Sweep canceled')
                 now, snapshot = monotonic(), worker.snapshot
@@ -49,8 +56,11 @@ def sweep(control, frame, waypoints, *, delta=False, log=None, cancel=None):
                 if age >= elapsed + settings.timeout: raise ControlError('Sweep arrival timed out')
                 while index < len(segments)-1 and age >= segments[index][0]: index += 1
                 end, start, target, duration = segments[index]
-                fraction = min(1., max(0., (age - end + duration) / duration))
-                az, el = (a + fraction*(b-a) for a, b in zip(start, target))
+                if target_at is None:
+                    fraction = min(1., max(0., (age - end + duration) / duration))
+                    az, el = (a + fraction*(b-a) for a, b in zip(start, target))
+                elif not final_sent:
+                    az, el = target_at(min(age, elapsed), origin)
                 sequence = worker.set_pointing(frame, azimuth=az, elevation=el, issued_at=now)
                 if log: log('target', issued_at=now, sequence=sequence, segment=index, commanded_azel=(az, el))
                 final_sent = age >= elapsed
